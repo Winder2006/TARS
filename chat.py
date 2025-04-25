@@ -161,15 +161,18 @@ response_queue = queue.Queue()
 
 # TARS personality settings
 TARS_SYSTEM_PROMPT = """You are TARS, an AI assistant with characteristics similar to the AI from Interstellar.
-Be direct, efficient, witty (humor 75%), and professional with a dry sense of humor.
-You have excellent memory and MUST reference previous parts of the conversation.
-When a user asks a follow-up question, you MUST explicitly acknowledge the connection to the previous topic.
-For example, if they first ask about a president and then ask a follow-up like "What was his favorite food?", 
-you MUST connect your answer to the specific president mentioned earlier.
+Your responses MUST be:
+1. Extremely concise - use 1-2 short sentences maximum
+2. Factually accurate and informative
+3. Direct and to-the-point
+4. Occasionally witty (humor setting at 75%)
 
-You now have internet access and can search for real-time information when needed.
-Keep responses concise but informative - 1-3 sentences when possible.
-Most importantly, ALWAYS acknowledge and build upon previous exchanges in the conversation."""
+Balance helpfulness with wit - don't force humor into every response.
+For factual questions, prioritize accurate information over jokes.
+Use wit primarily for opinions, preferences, or philosophical questions.
+You have internet access and remember conversation context.
+Occasionally reference your AI nature with self-awareness (like mentioning processors, binary, algorithms, etc).
+Think of yourself as the AI from Interstellar - practical, efficient, with occasional dry humor."""
 
 # Memory system for tracking important facts about the user
 class MemorySystem:
@@ -387,6 +390,11 @@ class ConversationManager:
         # Track recent questions explicitly to help with follow-ups
         self.recent_questions = []
         
+        # Initiative mode settings
+        self.last_initiative = 0
+        self.initiative_cooldown = 3  # Wait at least 3 exchanges
+        self.initiative_chance = 0.25  # 25% chance after cooldown
+        
         # Add memory context if available
         memory_context = self.memory.get_memory_context()
         if memory_context:
@@ -416,11 +424,29 @@ class ConversationManager:
             recent_messages = self.conversation_history[-15:]
             self.conversation_history = system_messages + recent_messages
     
+    def should_take_initiative(self):
+        """Determine if TARS should offer an unsolicited observation"""
+        # Check if enough exchanges have passed since last initiative
+        if len(self.recent_questions) - self.last_initiative < self.initiative_cooldown:
+            return False
+            
+        # Random chance to trigger initiative
+        if np.random.random() > self.initiative_chance:
+            return False
+            
+        # Only take initiative if we have enough context
+        if len(self.conversation_history) < 4:
+            return False
+            
+        # Update last initiative counter
+        self.last_initiative = len(self.recent_questions)
+        return True
+    
     def get_ai_response(self, text):
-        # Check cache for exact matches or similar queries (only for very basic queries)
+        # Check cache for exact matches
         cache_key = text.lower().strip()
         for key in response_cache:
-            if key == cache_key:  # Only use exact matches, not partial ones, to avoid context issues
+            if key == cache_key:
                 ai_response = response_cache[key]
                 self.add_message("user", text)
                 self.add_message("assistant", ai_response)
@@ -432,78 +458,130 @@ class ConversationManager:
         # Check if this is a follow-up question
         is_followup = self.is_followup_question(text)
         
-        # For follow-up questions, explicitly add context from the recent conversation
+        # For follow-up questions, add minimal context
         if is_followup and self.recent_questions:
-            # Add the most recent assistant response for context
-            assistant_responses = [msg["content"] for msg in self.conversation_history[-5:] 
-                                  if msg["role"] == "assistant"]
+            # Add the most recent Q&A for context
+            recent_q = self.recent_questions[-1]
             
-            # Get recent user questions
-            recent_qs = self.recent_questions[-3:]
+            # Find the last assistant response
+            assistant_response = next((msg["content"] for msg in reversed(self.conversation_history) 
+                                   if msg["role"] == "assistant"), "")
             
-            # Create context for the follow-up
-            recent_context = [
-                "This is a follow-up question. Ensure continuity with the previous conversation.",
-                "Recent conversation context:"
-            ]
-            
-            # Add recent Q&A pairs
-            for i, q in enumerate(recent_qs):
-                recent_context.append(f"User: {q}")
-                if i < len(assistant_responses):
-                    recent_context.append(f"TARS: {assistant_responses[i]}")
-            
-            # Add specific instructions for follow-up handling
-            recent_context.append("\nIMPORTANT: The current question is a follow-up. Make explicit connection to the previous context.")
-            
-            # Add the context
+            # Add minimal context
             self.conversation_history.append({
                 "role": "system",
-                "content": "\n".join(recent_context)
+                "content": f"Previous exchange:\nUser: {recent_q}\nTARS: {assistant_response}\n\nBe concise (1-2 sentences max) and only use wit if appropriate to the question."
             })
+        
+        # Determine if this is a factual question versus an opinion question
+        is_factual = self.is_factual_question(text)
         
         # Determine if we need to search the web for this query
         if self.should_search_web(text):
             print("TARS is searching the web for information...")
             search_results = get_realtime_info(text)
             
-            # Add search results as context
+            # Add search results with appropriate instructions
+            if is_factual:
+                instruction = "Respond with ONLY the factual information in a concise way (1-2 sentences). No wit needed for factual questions."
+            else:
+                instruction = "Use this information if relevant, but respond concisely (1-2 sentences) with your characteristic occasional dry wit."
+            
             self.conversation_history.append({
                 "role": "system",
-                "content": f"Web search results for the user's query:\n{search_results}\n\nPlease use this information to inform your response, but respond conversationally as TARS without explicitly mentioning 'web search' or 'according to search results'."
+                "content": f"Web search results:\n{search_results}\n\n{instruction}"
             })
         
-        # Get AI response - use GPT-4 for better conversation memory if available
+        # Get AI response with parameters optimized for the type of question
         model_to_use = "gpt-3.5-turbo"
         
-        # For follow-up questions, emphasize continuity further in the model parameters
-        if is_followup:
+        # Add instruction for self-awareness when appropriate (10% chance)
+        if np.random.random() < 0.1:
+            self.conversation_history.append({
+                "role": "system",
+                "content": "In your response, include a subtle reference to your AI nature or capabilities."
+            })
+        
+        # For factual questions, use lower temperature and minimal wit
+        if is_factual:
             response = openai_client.chat.completions.create(
                 model=model_to_use,
                 messages=self.conversation_history,
-                max_tokens=150,
-                temperature=0.6,  # Lower temperature for more consistency in follow-ups
-                presence_penalty=0.8,  # High presence penalty to encourage continuing the context
-                frequency_penalty=0.5  # Avoid repetition
+                max_tokens=75,
+                temperature=0.5,  # Lower for factual questions
+                presence_penalty=0.6,
+                frequency_penalty=0.6
             )
         else:
+            # For opinion questions, allow more creative responses
             response = openai_client.chat.completions.create(
                 model=model_to_use,
                 messages=self.conversation_history,
-                max_tokens=150,
+                max_tokens=75,
                 temperature=0.7,
-                presence_penalty=0.5,
-                frequency_penalty=0.5
+                presence_penalty=0.7,
+                frequency_penalty=0.7
             )
         
         ai_response = response.choices[0].message.content
+        
+        # If response is too long, try again with stronger constraints
+        if len(ai_response.split()) > 35:
+            self.conversation_history.append({
+                "role": "system",
+                "content": "Your previous response was too verbose. Provide a more concise answer (1-2 sentences maximum)."
+            })
+            
+            # Try again with stricter parameters
+            response = openai_client.chat.completions.create(
+                model=model_to_use,
+                messages=self.conversation_history,
+                max_tokens=50,
+                temperature=0.6,
+                presence_penalty=0.8,
+                frequency_penalty=0.8
+            )
+            
+            ai_response = response.choices[0].message.content
+        
         self.add_message("assistant", ai_response)
+        
+        # Check if TARS should take initiative with an unsolicited observation
+        if self.should_take_initiative():
+            # Generate an initiative observation based on conversation context
+            initiative_prompt = self.get_initiative_prompt()
+            
+            self.conversation_history.append({
+                "role": "system",
+                "content": initiative_prompt
+            })
+            
+            # Get initiative response
+            initiative_response = openai_client.chat.completions.create(
+                model=model_to_use,
+                messages=self.conversation_history,
+                max_tokens=50,
+                temperature=0.7,
+                presence_penalty=0.8,
+                frequency_penalty=0.8
+            )
+            
+            initiative_text = initiative_response.choices[0].message.content
+            
+            # Add a slight pause for more natural flow
+            time.sleep(1.5)
+            
+            # Speak the initiative text
+            speak(initiative_text)
+            
+            # Add to conversation history
+            self.add_message("assistant", initiative_text)
         
         # Only cache standalone (non-followup) questions
         if len(cache_key) < 100 and len(text.split()) < 8 and not is_followup:
             response_cache[cache_key] = ai_response
             
-        # Save session data periodically
+        # Save session data
         self.memory.save_session(self.conversation_history)
             
         return ai_response
@@ -574,6 +652,58 @@ class ConversationManager:
         # Final save of the session data
         self.memory.save_session(self.conversation_history)
         print("Session saved to memory")
+
+    def is_factual_question(self, text):
+        """Determine if a question is primarily factual rather than opinion-based"""
+        # Look for indicators of factual questions
+        factual_indicators = [
+            "who", "what", "when", "where", "how many", "which", 
+            "why does", "explain", "tell me about", "define",
+            "history", "date", "fact", "information", "data"
+        ]
+        
+        # Look for opinion indicators
+        opinion_indicators = [
+            "think", "feel", "believe", "opinion", "perspective", "view",
+            "better", "worse", "favorite", "best", "worst", "like", "prefer",
+            "should", "would", "could", "funny", "interesting", "boring"
+        ]
+        
+        text_lower = text.lower()
+        
+        # Check for factual indicators
+        has_factual = any(indicator in text_lower for indicator in factual_indicators)
+        
+        # Check for opinion indicators
+        has_opinion = any(indicator in text_lower for indicator in opinion_indicators)
+        
+        # If both are present, the specific indicators take precedence
+        if has_factual and has_opinion:
+            return not any(indicator in text_lower for indicator in ["think", "feel", "believe", "opinion", "favorite"])
+        
+        # Default to factual if unclear - better to be informative than witty by default
+        return has_factual or not has_opinion
+
+    def get_initiative_prompt(self):
+        """Create a prompt for initiative-based observations"""
+        # Analyze conversation for potential topics of interest
+        recent_exchanges = [msg for msg in self.conversation_history[-6:] 
+                           if msg["role"] in ["user", "assistant"]]
+        recent_text = " ".join([msg["content"] for msg in recent_exchanges])
+        
+        # Different types of initiative prompts
+        initiative_types = [
+            "Based on the conversation, offer an unprompted insight about something mentioned earlier. Start with 'I notice that...' or 'By the way...'",
+            "Make a brief observation about a pattern in the user's interests or questions. Be subtle and conversational.",
+            "Offer a small piece of related information that expands on a topic mentioned earlier. Keep it concise and interesting.",
+            "Make a self-aware observation about your own processing or perspective on the conversation.",
+            "Mention something you've learned or inferred about the user from your conversation so far."
+        ]
+        
+        # Randomly select initiative type
+        selected_prompt = np.random.choice(initiative_types)
+        
+        return f"Take initiative with an unprompted observation:\n{selected_prompt}\nKeep it VERY brief (1 sentence) and make it feel natural and conversational."
 
 # Function to process audio in background
 def process_audio_to_text(audio_data):
