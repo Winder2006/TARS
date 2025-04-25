@@ -18,9 +18,23 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 import re
+import librosa
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+import joblib
+from tempfile import NamedTemporaryFile
 
 # Load environment variables
 load_dotenv()
+
+# Create data directories for voice profiles and conversation storage
+MEMORY_DIR = Path("memory")
+SESSIONS_DIR = MEMORY_DIR / "sessions"
+VOICE_PROFILES_DIR = MEMORY_DIR / "voice_profiles"
+MEMORY_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR.mkdir(exist_ok=True)
+VOICE_PROFILES_DIR.mkdir(exist_ok=True)
 
 # Initialize clients - Create at startup to establish connections
 print("Initializing AI services...")
@@ -65,85 +79,249 @@ else:
         print("Running in text-only mode (no voice)")
         voice_enabled = False
 
-# Create data directories for conversation storage
-MEMORY_DIR = Path("memory")
-SESSIONS_DIR = MEMORY_DIR / "sessions"
-MEMORY_DIR.mkdir(exist_ok=True)
-SESSIONS_DIR.mkdir(exist_ok=True)
-
-# Web search functionality
-def search_web(query, num_results=3):
-    """Search the web for information using a simple HTTP request."""
-    print(f"Searching the web for: {query}")
+# Voice Recognition System
+class VoiceRecognition:
+    def __init__(self):
+        self.model_path = VOICE_PROFILES_DIR / "voice_model.pkl"
+        self.features_path = VOICE_PROFILES_DIR / "voice_features.pkl"
+        self.profiles_path = VOICE_PROFILES_DIR / "profiles.json"
+        self.model = None
+        self.scaler = None
+        self.profiles = self._load_profiles()
+        self.current_user = None
+        self._load_model()
+        
+    def _load_profiles(self):
+        """Load saved voice profiles"""
+        if self.profiles_path.exists():
+            try:
+                with open(self.profiles_path, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
     
-    try:
-        # Use DuckDuckGo for simple searches without API key requirements
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    def _save_profiles(self):
+        """Save voice profiles"""
+        with open(self.profiles_path, 'w') as f:
+            json.dump(self.profiles, f, indent=2)
+    
+    def _load_model(self):
+        """Load voice recognition model if available"""
+        if self.model_path.exists() and self.features_path.exists():
+            try:
+                self.model = joblib.load(self.model_path)
+                self.scaler = joblib.load(self.features_path)
+                print("Voice recognition model loaded successfully")
+                return True
+            except Exception as e:
+                print(f"Error loading voice model: {e}")
+        return False
+    
+    def _save_model(self):
+        """Save voice recognition model"""
+        if self.scaler:
+            joblib.dump(self.scaler, self.features_path)
+            
+        if self.model:
+            joblib.dump(self.model, self.model_path)
+    
+    def extract_features(self, audio_data, sr=44100):
+        """Extract audio features for voice recognition"""
+        try:
+            # Convert the audio data to a numpy array if it's not already
+            if isinstance(audio_data, io.BytesIO):
+                audio_data.seek(0)
+                # Load with librosa directly
+                audio, sr = librosa.load(audio_data, sr=sr)
+            elif isinstance(audio_data, np.ndarray):
+                # Already a numpy array
+                audio = audio_data
+            else:
+                print(f"Unknown audio data type: {type(audio_data)}")
+                return None
+                
+            # Check if audio has enough content
+            if len(audio) < sr:  # Less than 1 second
+                print("Audio sample too short")
+                return None
+                
+            # Extract MFCC features (Mel-frequency cepstral coefficients)
+            mfccs = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+            
+            # Only process if we got valid MFCCs
+            if mfccs.size == 0:
+                print("Failed to extract MFCCs")
+                return None
+                
+            mfcc_means = np.mean(mfccs, axis=1)
+            mfcc_vars = np.var(mfccs, axis=1)
+            
+            # Extract spectral features
+            spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr)
+            spectral_contrast = librosa.feature.spectral_contrast(y=audio, sr=sr)
+            
+            # Create feature vector
+            features = np.hstack([
+                mfcc_means, 
+                mfcc_vars, 
+                np.mean(spectral_centroid), 
+                np.mean(spectral_rolloff),
+                np.mean(spectral_contrast, axis=1)
+            ])
+            
+            return features
+        except Exception as e:
+            print(f"Error extracting features: {str(e)}")
+            return None
+    
+    def enroll_user(self, name, audio_samples):
+        """Enroll a new user with voice samples"""
+        print(f"Enrolling user: {name}")
+        
+        features_list = []
+        for sample in audio_samples:
+            features = self.extract_features(sample)
+            if features is not None:
+                features_list.append(features)
+        
+        if not features_list:
+            print("Failed to extract features from audio samples")
+            return False
+        
+        # Add user to profiles
+        user_id = len(self.profiles) + 1
+        self.profiles[str(user_id)] = {
+            "name": name,
+            "samples": len(features_list),
+            "id": user_id,
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         
-        # Format the query for URL
-        search_query = query.replace(' ', '+')
-        url = f"https://html.duckduckgo.com/html/?q={search_query}"
+        self._save_profiles()
         
-        response = requests.get(url, headers=headers, timeout=10)
+        # Save the user's feature samples
+        self.save_user_samples(user_id, features_list)
         
-        if response.status_code != 200:
-            return f"Search failed with status code: {response.status_code}"
-        
-        # Parse the HTML response
-        soup = BeautifulSoup(response.text, 'html.parser')
-        results = soup.find_all('div', {'class': 'result__body'})
-        
-        if not results:
-            return "No search results found."
-        
-        # Extract and format the results
-        formatted_results = []
-        
-        for i, result in enumerate(results[:num_results]):
-            title_elem = result.find('a', {'class': 'result__a'})
-            snippet_elem = result.find('a', {'class': 'result__snippet'})
-            
-            title = title_elem.text.strip() if title_elem else "No title"
-            snippet = snippet_elem.text.strip() if snippet_elem else "No description"
-            
-            formatted_results.append(f"Result {i+1}: {title}\n{snippet}\n")
-        
-        return "\n".join(formatted_results)
+        # Retrain model with new samples
+        return self._train_model()
     
-    except Exception as e:
-        return f"Error during web search: {str(e)}"
+    def _train_model(self):
+        """Train/retrain the voice recognition model"""
+        print("Training voice recognition model...")
+        
+        # Collect all user samples
+        all_profiles_path = list(VOICE_PROFILES_DIR.glob("user_*_samples.pkl"))
+        
+        if not all_profiles_path:
+            print("No voice samples found for training")
+            return False
+        
+        features_list = []
+        labels = []
+        
+        for profile_path in all_profiles_path:
+            user_id = profile_path.stem.split('_')[1]
+            
+            try:
+                with open(profile_path, 'rb') as f:
+                    user_samples = pickle.load(f)
+                    
+                for sample in user_samples:
+                    features_list.append(sample)
+                    labels.append(int(user_id))
+            except Exception as e:
+                print(f"Error loading samples for user {user_id}: {e}")
+        
+        if not features_list:
+            print("No features could be loaded for training")
+            return False
+        
+        # Convert to numpy arrays
+        X = np.array(features_list)
+        y = np.array(labels)
+        
+        # Scale features
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Check if we have only one user
+        unique_users = len(np.unique(y))
+        if unique_users < 2:
+            print(f"Only {unique_users} user detected. Voice identification requires at least 2 users.")
+            print("Voice recognition will be available once more users are enrolled.")
+            # Still save the scaler for future use
+            self._save_model()
+            return True  # Return true so enrollment "succeeds" even though we can't train yet
+        
+        # Train model (SVM for voice recognition)
+        self.model = SVC(kernel='rbf', probability=True)
+        self.model.fit(X_scaled, y)
+        
+        # Save model
+        self._save_model()
+        
+        print(f"Voice recognition model trained with {len(X)} samples from {len(set(y))} users")
+        return True
+    
+    def save_user_samples(self, user_id, samples):
+        """Save feature samples for a user"""
+        samples_path = VOICE_PROFILES_DIR / f"user_{user_id}_samples.pkl"
+        with open(samples_path, 'wb') as f:
+            pickle.dump(samples, f)
+    
+    def identify_speaker(self, audio_data):
+        """Identify the speaker from audio data"""
+        if not self.model:
+            # Check if we have only one user profile
+            if len(self.profiles) == 1:
+                # If only one user, just return that user
+                user_id = list(self.profiles.keys())[0]
+                self.current_user = self.profiles[user_id]["name"]
+                return self.current_user
+            
+            print("Voice recognition model not loaded")
+            return None
+        
+        features = self.extract_features(audio_data)
+        if features is None:
+            print("Could not extract voice features - audio quality may be insufficient")
+            return None
+        
+        # Scale features
+        features_scaled = self.scaler.transform(features.reshape(1, -1))
+        
+        # Predict
+        prediction = self.model.predict(features_scaled)[0]
+        probabilities = self.model.predict_proba(features_scaled)[0]
+        
+        # Get confidence
+        confidence = probabilities[prediction-1]  # Adjust for 1-based indexing
+        
+        # Lower the confidence threshold from 0.7 to 0.55
+        if confidence < 0.55:  # More forgiving threshold
+            print(f"Speaker not recognized with sufficient confidence ({confidence:.2f})")
+            return None
+        
+        user_id = str(prediction)
+        if user_id in self.profiles:
+            self.current_user = self.profiles[user_id]["name"]
+            print(f"Recognized speaker: {self.current_user} (confidence: {confidence:.2f})")
+            return self.current_user
+        
+        return None
+    
+    def has_users(self):
+        """Check if there are enrolled users"""
+        return len(self.profiles) > 0
+    
+    def get_current_user(self):
+        """Get the current recognized user"""
+        return self.current_user
 
-# Search for real-time information like weather and news
-def get_realtime_info(query):
-    """Get real-time information based on the query."""
-    if re.search(r'weather|temperature|forecast', query.lower()):
-        return search_web(f"current weather {query}")
-    elif re.search(r'news|latest|recent', query.lower()):
-        return search_web(f"latest news {query}")
-    elif re.search(r'time|date|day', query.lower()):
-        now = datetime.datetime.now()
-        return f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
-    else:
-        return search_web(query)
-
-# Preload connection to OpenAI - This helps reduce cold start time
-def preload_openai():
-    try:
-        # Make a very small request to warm up the connection
-        openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": "Hi"}],
-            max_tokens=5
-        )
-    except Exception as e:
-        print(f"OpenAI preload warning: {e}")
-
-# Start preloading in background
-preload_thread = threading.Thread(target=preload_openai)
-preload_thread.daemon = True
-preload_thread.start()
+# Initialize Voice Recognition system
+voice_recognition = VoiceRecognition()
 
 # Audio settings - Optimized for speed
 CHUNK_SIZE = 2048
@@ -190,9 +368,9 @@ class MemorySystem:
                 with open(self.memory_file, 'r') as f:
                     return json.load(f)
             except:
-                return {"user_facts": {}, "preferences": {}, "important_topics": []}
+                return {"user_facts": {}, "preferences": {}, "important_topics": [], "user_specific": {}}
         else:
-            return {"user_facts": {}, "preferences": {}, "important_topics": []}
+            return {"user_facts": {}, "preferences": {}, "important_topics": [], "user_specific": {}}
     
     def save_memory(self):
         with open(self.memory_file, 'w') as f:
@@ -247,8 +425,8 @@ class MemorySystem:
             # Fallback to simple truncation if API call fails
             return conversation[:200] + "..."
     
-    def extract_user_facts(self, message):
-        # Extract facts from user messages to remember for future conversations
+    def extract_user_facts(self, message, user=None):
+        """Extract facts from user messages, optionally for a specific user"""
         if len(message.split()) < 5:  # Skip very short messages
             return
             
@@ -272,12 +450,28 @@ class MemorySystem:
                     if fact and len(fact) > 3:
                         fact_key = fact.lower()[:20]  # Create a simple key
                         self.facts["user_facts"][fact_key] = fact
+                        
+                        # If we have a specific user, also add to their memory
+                        if user:
+                            if user not in self.facts.get("user_specific", {}):
+                                self.facts["user_specific"][user] = {"facts": [], "preferences": []}
+                            
+                            if fact not in self.facts["user_specific"][user].get("facts", []):
+                                self.facts["user_specific"][user]["facts"].append(fact)
                 
                 # Update preferences
                 for pref in result.get("preferences", []):
                     if pref and len(pref) > 3:
                         pref_key = pref.lower()[:20]
                         self.facts["preferences"][pref_key] = pref
+                        
+                        # If we have a specific user, also add to their memory
+                        if user:
+                            if user not in self.facts.get("user_specific", {}):
+                                self.facts["user_specific"][user] = {"facts": [], "preferences": []}
+                            
+                            if pref not in self.facts["user_specific"][user].get("preferences", []):
+                                self.facts["user_specific"][user]["preferences"].append(pref)
                 
                 # Save if we learned something new
                 if result.get("facts") or result.get("preferences"):
@@ -318,6 +512,23 @@ class MemorySystem:
                 memory_text.append(f"Session {i+1} [{session['timestamp']}]: {session['summary']}")
         
         return "\n".join(memory_text)
+    
+    def get_user_memory(self, user):
+        """Get memory specific to a recognized user"""
+        if user in self.facts.get("user_specific", {}):
+            memory = self.facts["user_specific"][user]
+            memory_text = []
+            
+            if "facts" in memory:
+                memory_text.append(f"Facts about {user}:")
+                memory_text.extend([f"- {fact}" for fact in memory["facts"][:5]])
+                
+            if "preferences" in memory:
+                memory_text.append(f"\n{user}'s preferences:")
+                memory_text.extend([f"- {pref}" for pref in memory["preferences"][:5]])
+                
+            return "\n".join(memory_text)
+        return ""
 
 # Simple response cache to avoid regenerating common responses
 response_cache = {
@@ -328,6 +539,7 @@ response_cache = {
     "who are you": "I'm TARS, an AI assistant designed to help with a range of tasks.",
 }
 
+# Audio Recording with Voice Recognition
 class AudioRecorder:
     def __init__(self):
         self.recording = False
@@ -371,14 +583,61 @@ class AudioRecorder:
             wav_buffer.seek(0)
             return wav_buffer
         return None
-
-def transcribe_audio(audio_data):
-    transcript = openai_client.audio.transcriptions.create(
-        model="whisper-1",
-        file=("recording.wav", audio_data.read()),
-        language="en"
-    )
-    return transcript.text
+    
+    def start_enrollment(self, name, num_samples=3):
+        """Record audio samples for user enrollment"""
+        print(f"Starting enrollment for {name}...")
+        print(f"We'll need {num_samples} audio samples. Please speak naturally for each sample.")
+        print("Each sample should be about 3-5 seconds of continuous speech.")
+        
+        samples = []
+        raw_audio_samples = []
+        
+        for i in range(num_samples):
+            print(f"\nSample {i+1}/{num_samples} - Press Enter to start recording")
+            input()
+            self.start_recording()
+            audio_data = self.get_audio_data()
+            
+            if audio_data:
+                # Make a copy of the audio data for later feature extraction
+                audio_copy = io.BytesIO()
+                audio_data.seek(0)
+                audio_copy.write(audio_data.read())
+                audio_copy.seek(0)
+                audio_data.seek(0)
+                
+                # Try to extract features right away to check validity
+                try:
+                    # Convert to numpy for analysis
+                    audio_array = sf.read(audio_copy)[0]
+                    
+                    # Check if audio has content (not silence)
+                    if np.mean(np.abs(audio_array)) < 0.01:
+                        print(f"Sample {i+1} appears to be silence. Please try again with your voice.")
+                        i -= 1
+                        continue
+                        
+                    print(f"Sample {i+1} recorded successfully")
+                    samples.append(audio_copy)
+                    raw_audio_samples.append(audio_array)
+                except Exception as e:
+                    print(f"Error processing sample {i+1}: {e}")
+                    print("Please try again.")
+                    i -= 1
+            else:
+                print(f"No audio detected for sample {i+1}. Please try again.")
+                i -= 1
+        
+        # Directly use the raw audio samples for feature extraction
+        success = voice_recognition.enroll_user(name, raw_audio_samples)
+        
+        if success:
+            print(f"Enrollment successful for {name}!")
+            return True
+        else:
+            print("Enrollment failed. Please try again.")
+            return False
 
 class ConversationManager:
     def __init__(self):
@@ -395,12 +654,38 @@ class ConversationManager:
         self.initiative_cooldown = 3  # Wait at least 3 exchanges
         self.initiative_chance = 0.25  # 25% chance after cooldown
         
+        # User recognition
+        self.recognized_user = None
+        
         # Add memory context if available
         memory_context = self.memory.get_memory_context()
         if memory_context:
             self.conversation_history.append(
                 {"role": "system", "content": f"Memory context about the user:\n{memory_context}"}
             )
+    
+    def recognize_user(self, audio_data):
+        """Try to recognize the user from audio data"""
+        if not voice_recognition.has_users():
+            return None
+            
+        user = voice_recognition.identify_speaker(audio_data)
+        if user:
+            self.recognized_user = user
+            
+            # Add user context to the conversation
+            self.conversation_history.append(
+                {"role": "system", "content": f"The current speaker has been identified as: {user}. Personalize your responses accordingly."}
+            )
+            
+            # Add user-specific memory if available
+            user_memory = self.memory.get_user_memory(user)
+            if user_memory:
+                self.conversation_history.append(
+                    {"role": "system", "content": f"Specific memory for {user}:\n{user_memory}"}
+                )
+            
+        return user
         
     def add_message(self, role, content):
         # Add to conversation history
@@ -415,7 +700,12 @@ class ConversationManager:
                 self.recent_questions.pop(0)
                 
             # Extract facts for memory
-            self.memory.extract_user_facts(content)
+            if self.recognized_user:
+                # If we know who's speaking, store user-specific facts
+                self.memory.extract_user_facts(content, self.recognized_user)
+            else:
+                # Otherwise, just store general facts
+                self.memory.extract_user_facts(content)
         
         # Keep a reasonable history size - increased for better memory
         if len(self.conversation_history) > 20:
@@ -709,9 +999,24 @@ class ConversationManager:
 def process_audio_to_text(audio_data):
     if audio_data:
         try:
-            return transcribe_audio(audio_data)
+            transcript = transcribe_audio(audio_data)
+            if not transcript or len(transcript.strip()) < 2:
+                return "Sorry, I couldn't understand what you said. Please try speaking clearly and a bit louder."
+            return transcript
         except Exception as e:
-            return f"Error transcribing audio: {str(e)}"
+            error_msg = str(e)
+            print(f"Error transcribing audio: {error_msg}")
+            
+            if "too_short" in error_msg.lower():
+                return "The audio was too short. Please speak for at least 1-2 seconds."
+            elif "no_speech" in error_msg.lower() or "no speech" in error_msg.lower():
+                return "I couldn't detect any speech. Please check your microphone."
+            elif "format" in error_msg.lower():
+                return "There was an issue with the audio format. Please try again."
+            elif "ffmpeg" in error_msg.lower():
+                return "Audio conversion issue. Please check if ffmpeg is installed."
+            else:
+                return "There was a problem understanding your speech. Please try again."
     return None
 
 # Function to get AI response in background
@@ -830,14 +1135,8 @@ def chat_with_ai():
     
     if voice_enabled:
         print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled.")
-    else:
-        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled. (Text-only mode)")
-    
-    print("\nPress Enter to start recording, then press Enter again to stop.")
-    print("Type text directly, or type 'quit' to exit.")
-    
-    # Preload common responses in background if voice is enabled
-    if voice_enabled:
+        
+        # Preload common responses in background if voice is enabled
         def preload_voice_responses():
             for text in ["I'm not sure I understand that.", "Could you clarify?", "Processing your request."]:
                 try:
@@ -857,6 +1156,36 @@ def chat_with_ai():
         
         # Start preloading voice responses
         executor.submit(preload_voice_responses)
+    else:
+        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled. (Text-only mode)")
+    
+    # Check if we have voice profiles
+    if voice_recognition.has_users():
+        print(f"Voice recognition enabled with {len(voice_recognition.profiles)} user profiles.")
+    else:
+        print("No voice profiles found. Would you like to test the microphone first? (test/enroll/skip)")
+        choice = input().lower()
+        if choice.startswith('t'):
+            # Run a quick microphone test
+            test_audio_capture(recorder)
+        elif choice.startswith('e'):
+            print("Please enter your name:")
+            name = input().strip()
+            if name:
+                recorder.start_enrollment(name, num_samples=3)
+        # Skip otherwise
+    
+    print("\nPress Enter to start recording, then press Enter again to stop.")
+    print("Type text directly, or type 'quit' to exit.")
+    print("Type 'enroll' to add a new voice profile.")
+    print("Type 'test' to test your microphone.")
+    
+    # Additional commands
+    print("Additional commands:")
+    print("- 'enroll': Add a new voice profile")
+    print("- 'who': Check which user is currently recognized")
+    print("- 'reset': Reset user recognition for this session")
+    print("- 'test': Test your microphone")
     
     # Check for previous conversations
     memory_context = conversation.memory.get_memory_context()
@@ -866,14 +1195,37 @@ def chat_with_ai():
     try:
         while True:
             user_input = input("\nPress Enter to speak or type your message (or 'quit'): ")
+            
+            # Check for special commands
             if user_input.lower() == 'quit':
                 # Save session before exiting
                 conversation.save_session()
                 print("\nTARS: Powering down. Session saved to memory.")
                 break
+            elif user_input.lower() == 'enroll':
+                print("Please enter the name for the new voice profile:")
+                name = input().strip()
+                if name:
+                    recorder.start_enrollment(name, num_samples=3)
+                continue
+            elif user_input.lower() == 'who':
+                current_user = voice_recognition.get_current_user()
+                if current_user:
+                    print(f"TARS: I currently recognize you as {current_user}.")
+                else:
+                    print("TARS: I haven't recognized your voice yet in this session.")
+                continue
+            elif user_input.lower() == 'reset':
+                voice_recognition.current_user = None
+                conversation.recognized_user = None
+                print("TARS: Voice recognition reset for this session.")
+                continue
+            elif user_input.lower() == 'test':
+                test_audio_capture(recorder)
+                continue
                 
             # If user typed something instead of just pressing Enter to speak
-            if user_input.strip() and user_input.lower() != 'quit':
+            if user_input.strip() and user_input.lower() not in ['quit', 'enroll', 'who', 'reset', 'test']:
                 print(f"You typed: {user_input}")
                 
                 # Get AI response in background
@@ -895,6 +1247,10 @@ def chat_with_ai():
             audio_data = recorder.get_audio_data()
             
             if audio_data:
+                # Try to recognize the speaker first
+                conversation.recognize_user(audio_data)
+                current_user = voice_recognition.get_current_user()
+                
                 # Start transcription immediately
                 future = executor.submit(process_audio_to_text, audio_data)
                 
@@ -904,7 +1260,10 @@ def chat_with_ai():
                 user_text = future.result()
                 
                 if user_text:
-                    print(f"You said: {user_text}")
+                    if current_user:
+                        print(f"{current_user} said: {user_text}")
+                    else:
+                        print(f"You said: {user_text}")
                     
                     # Early acknowledgment - makes the system feel more responsive
                     if len(user_text.split()) > 5:  # Only for longer queries
@@ -925,6 +1284,201 @@ def chat_with_ai():
         # Also save session on CTRL+C exit
         conversation.save_session()
         print("\nTARS: Session saved to memory. Shutting down.")
+
+# Add a function to test audio capture and feature extraction
+def test_audio_capture(recorder):
+    """Test audio capture and feature extraction without enrollment"""
+    print("\n### Audio Test Mode ###")
+    print("This will test your microphone and audio processing.")
+    print("Please press Enter to start recording, then speak normally for 3-5 seconds.")
+    input()
+    
+    # Record audio
+    recorder.start_recording()
+    audio_data = recorder.get_audio_data()
+    
+    if not audio_data:
+        print("❌ No audio detected. Check your microphone settings.")
+        return False
+        
+    # Test 1: Check if we can transcribe the audio
+    print("Testing audio transcription...")
+    try:
+        audio_data.seek(0)
+        transcript = transcribe_audio(audio_data)
+        if transcript:
+            print(f"✅ Transcription successful: '{transcript}'")
+        else:
+            print("❌ Transcription failed - no text detected.")
+    except Exception as e:
+        print(f"❌ Transcription error: {str(e)}")
+    
+    # Test 2: Check if we can extract features
+    print("Testing feature extraction...")
+    try:
+        audio_data.seek(0)
+        # Use librosa to load the audio
+        audio_array, sr = sf.read(audio_data)
+        features = voice_recognition.extract_features(audio_array)
+        
+        if features is not None:
+            print(f"✅ Feature extraction successful: {len(features)} features extracted")
+        else:
+            print("❌ Feature extraction failed")
+    except Exception as e:
+        print(f"❌ Feature extraction error: {str(e)}")
+    
+    # Test 3: Analyze audio quality
+    try:
+        # Calculate signal-to-noise ratio and volume level
+        abs_audio = np.abs(audio_array)
+        mean_volume = np.mean(abs_audio)
+        max_volume = np.max(abs_audio)
+        
+        print(f"Audio quality analysis:")
+        if mean_volume < 0.01:
+            print("❌ Audio volume is very low. Please speak louder or adjust microphone.")
+        elif mean_volume > 0.5:
+            print("⚠️ Audio volume is very high. Your microphone might be picking up too much.")
+        else:
+            print("✅ Audio volume level appears good.")
+            
+        # Simple silence detection
+        silent_threshold = 0.01
+        silent_portions = np.mean(abs_audio < silent_threshold)
+        if silent_portions > 0.5:
+            print("❌ Too much silence detected. Please speak more continuously.")
+        else:
+            print("✅ Speech continuity looks good.")
+    except Exception as e:
+        print(f"❌ Audio analysis error: {str(e)}")
+    
+    print("\nAudio test complete.")
+    print("If all tests pass, you should be able to enroll successfully.")
+    return True
+
+# Add back the missing web search function
+def search_web(query, num_results=3):
+    """Search the web for information using a simple HTTP request."""
+    print(f"Searching the web for: {query}")
+    
+    try:
+        # Use DuckDuckGo for simple searches without API key requirements
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # Format the query for URL
+        search_query = query.replace(' ', '+')
+        url = f"https://html.duckduckgo.com/html/?q={search_query}"
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return f"Search failed with status code: {response.status_code}"
+        
+        # Parse the HTML response
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = soup.find_all('div', {'class': 'result__body'})
+        
+        if not results:
+            return "No search results found."
+        
+        # Extract and format the results
+        formatted_results = []
+        
+        for i, result in enumerate(results[:num_results]):
+            title_elem = result.find('a', {'class': 'result__a'})
+            snippet_elem = result.find('a', {'class': 'result__snippet'})
+            
+            title = title_elem.text.strip() if title_elem else "No title"
+            snippet = snippet_elem.text.strip() if snippet_elem else "No description"
+            
+            formatted_results.append(f"Result {i+1}: {title}\n{snippet}\n")
+        
+        return "\n".join(formatted_results)
+    
+    except Exception as e:
+        return f"Error during web search: {str(e)}"
+
+# Add back get_realtime_info function for searches
+def get_realtime_info(query):
+    """Get real-time information based on the query."""
+    if re.search(r'weather|temperature|forecast', query.lower()):
+        return search_web(f"current weather {query}")
+    elif re.search(r'news|latest|recent', query.lower()):
+        return search_web(f"latest news {query}")
+    elif re.search(r'time|date|day', query.lower()):
+        now = datetime.datetime.now()
+        return f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    else:
+        return search_web(query)
+
+# Add back the preload OpenAI function
+def preload_openai():
+    try:
+        # Make a very small request to warm up the connection
+        openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Hi"}],
+            max_tokens=5
+        )
+    except Exception as e:
+        print(f"OpenAI preload warning: {e}")
+
+# Start preloading in background
+preload_thread = threading.Thread(target=preload_openai)
+preload_thread.daemon = True
+preload_thread.start()
+
+# Add back the transcribe_audio function
+def transcribe_audio(audio_data):
+    try:
+        # Convert WAV data to mp3 format using ffmpeg in a temp file
+        from tempfile import NamedTemporaryFile
+        import subprocess
+        
+        # Create temp files for wav and mp3
+        with NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+            with NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
+                wav_path = wav_file.name
+                mp3_path = mp3_file.name
+        
+        # Write the audio data to the wav file
+        audio_data.seek(0)
+        with open(wav_path, "wb") as f:
+            f.write(audio_data.read())
+        
+        # Convert wav to mp3 using ffmpeg
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-qscale:a", "2", 
+                mp3_path
+            ], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error converting audio format: {e}")
+            print(f"ffmpeg stderr: {e.stderr.decode()}")
+            raise Exception("Failed to convert audio to MP3 format")
+        
+        # Now send the mp3 file to OpenAI
+        with open(mp3_path, "rb") as mp3_file:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=("recording.mp3", mp3_file.read()),
+                language="en"
+            )
+        
+        # Clean up temp files
+        try:
+            os.remove(wav_path)
+            os.remove(mp3_path)
+        except:
+            pass  # Ignore cleanup errors
+            
+        return transcript.text
+    except Exception as e:
+        print(f"Transcription error: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     chat_with_ai() 
