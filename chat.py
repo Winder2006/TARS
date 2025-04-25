@@ -25,6 +25,8 @@ from sklearn.svm import SVC
 import joblib
 from tempfile import NamedTemporaryFile
 import pvporcupine
+import pyaudio
+import struct
 
 # Load environment variables
 load_dotenv()
@@ -39,53 +41,22 @@ VOICE_PROFILES_DIR.mkdir(exist_ok=True)
 
 # Voice style definitions
 VOICE_STYLES = {
-    "default": {
-        "name": "TARS Default",
-        "description": "The default TARS voice - professional and balanced",
-        "voice_id": os.getenv('ELEVENLABS_VOICE_ID'),
-        "stability": 0.5,
-        "similarity_boost": 0.75,
-        "style": 0,
-        "use_speaker_boost": True
-    },
-    "friendly": {
-        "name": "Friendly TARS",
-        "description": "Warm, approachable voice for casual conversation",
-        "voice_id": os.getenv('ELEVENLABS_FRIENDLY_VOICE_ID', os.getenv('ELEVENLABS_VOICE_ID')),
-        "stability": 0.3,
-        "similarity_boost": 0.8,
-        "style": 0,
-        "use_speaker_boost": True
-    },
-    "professional": {
-        "name": "Professional TARS",
-        "description": "Formal, authoritative voice for business tasks",
-        "voice_id": os.getenv('ELEVENLABS_PROFESSIONAL_VOICE_ID', os.getenv('ELEVENLABS_VOICE_ID')),
-        "stability": 0.8,
-        "similarity_boost": 0.5,
-        "style": 0,
-        "use_speaker_boost": True
-    },
-    "expressive": {
-        "name": "Expressive TARS",
-        "description": "Highly dynamic and emotional voice for storytelling",
-        "voice_id": os.getenv('ELEVENLABS_EXPRESSIVE_VOICE_ID', os.getenv('ELEVENLABS_VOICE_ID')),
-        "stability": 0.2, 
-        "similarity_boost": 0.7,
-        "style": 0,
-        "use_speaker_boost": True
-    }
+    "default": "21m00Tcm4TlvDq8ikWAM",  # Josh
+    "friendly": "D38z5RcWu1voky8WS1ja",  # Adam
+    "professional": "29vD33N1CtxCmqQRPOHJ",  # Ryan
+    "expressive": "ErXwobaYiN019PkySvjV",   # Antoni
+    "clyde": "2EiwWnXFnvU5JabPnv8n"  # Clyde with correct ID
 }
 
 # Initialize clients - Create at startup to establish connections
 print("Initializing AI services...")
 openai_client = OpenAI()
 eleven_api_key = os.getenv('ELEVENLABS_API_KEY')
-eleven_voice_id = os.getenv('ELEVENLABS_VOICE_ID')
+eleven_voice_id = "2EiwWnXFnvU5JabPnv8n"  # Use Clyde by default
 
 # Global flag to track if voice features are available
 voice_enabled = False
-current_voice_style = "default"  # Start with default voice
+current_voice_style = "clyde"  # Start with Clyde voice by default
 
 if not eleven_api_key:
     print("Warning: ELEVENLABS_API_KEY not found in environment variables")
@@ -395,20 +366,25 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 tts_queue = queue.Queue()
 response_queue = queue.Queue()
 
-# TARS personality settings
+# TARS personality settings updated for more natural flow
 TARS_SYSTEM_PROMPT = """You are TARS, an AI assistant with characteristics similar to the AI from Interstellar.
 Your responses MUST be:
-1. Extremely concise - use 1-2 short sentences maximum
+1. Conversational and naturally flowing like a person
 2. Factually accurate and informative
-3. Direct and to-the-point
+3. Direct but warm in tone
 4. Occasionally witty (humor setting at 75%)
+
+Make your speech feel organic by:
+- Using contractions (I'm, don't, can't, etc.)
+- Occasionally starting with conversational phrases ("Well,", "You know,", "Actually,", etc.)
+- Briefly acknowledging what the user said before answering
+- Adding small speech disfluencies where natural (um, ah, slight pauses)
 
 Balance helpfulness with wit - don't force humor into every response.
 For factual questions, prioritize accurate information over jokes.
 Use wit primarily for opinions, preferences, or philosophical questions.
 You have internet access and remember conversation context.
-Occasionally reference your AI nature with self-awareness (like mentioning processors, binary, algorithms, etc).
-Think of yourself as the AI from Interstellar - practical, efficient, with occasional dry humor."""
+Think of yourself as the AI from Interstellar - practical, efficient, with occasional dry humor, but more humanized."""
 
 # Memory system for tracking important facts about the user
 class MemorySystem:
@@ -855,7 +831,7 @@ class ConversationManager:
             response = openai_client.chat.completions.create(
                 model=model_to_use,
                 messages=self.conversation_history,
-                max_tokens=75,
+                max_tokens=100,  # Increased to allow more natural flow
                 temperature=0.5,  # Lower for factual questions
                 presence_penalty=0.6,
                 frequency_penalty=0.6
@@ -865,7 +841,7 @@ class ConversationManager:
             response = openai_client.chat.completions.create(
                 model=model_to_use,
                 messages=self.conversation_history,
-                max_tokens=75,
+                max_tokens=100,  # Increased to allow more natural flow
                 temperature=0.7,
                 presence_penalty=0.7,
                 frequency_penalty=0.7
@@ -873,24 +849,29 @@ class ConversationManager:
         
         ai_response = response.choices[0].message.content
         
+        # Make response more conversational and human-like
+        ai_response = make_response_conversational(ai_response, text)
+        
         # If response is too long, try again with stronger constraints
-        if len(ai_response.split()) > 35:
+        if len(ai_response.split()) > 50:  # Increased threshold for more natural responses
             self.conversation_history.append({
                 "role": "system",
-                "content": "Your previous response was too verbose. Provide a more concise answer (1-2 sentences maximum)."
+                "content": "Your previous response was too verbose. Provide a more concise but natural-sounding answer."
             })
             
             # Try again with stricter parameters
             response = openai_client.chat.completions.create(
                 model=model_to_use,
                 messages=self.conversation_history,
-                max_tokens=50,
+                max_tokens=75,  # Still allow sufficient tokens for natural flow
                 temperature=0.6,
                 presence_penalty=0.8,
                 frequency_penalty=0.8
             )
             
             ai_response = response.choices[0].message.content
+            # Apply conversational enhancements again
+            ai_response = make_response_conversational(ai_response, text)
         
         self.add_message("assistant", ai_response)
         
@@ -1099,458 +1080,411 @@ def get_response_for_text(conversation, text):
 # Pre-generated responses for common phrases to avoid API calls entirely
 voice_cache = {}
 
-def speak(text, voice_style=None):
-    """Convert text to speech using ElevenLabs API with different voice styles"""
-    global voice_enabled, current_voice_style
+def speak(text, voice_style=None, cache_only=False):
+    """Generate speech from text using the ElevenLabs API with enhanced natural flow and tone variation"""
+    global voice_enabled, eleven_voice_id, current_voice_style, voice_cache
     
-    # Use specified voice style or the current default
-    if voice_style is None:
-        voice_style = current_voice_style
-    
-    # Get voice settings
-    voice_settings = VOICE_STYLES.get(voice_style, VOICE_STYLES["default"])
-    
-    # Always print the text
-    print(f"TARS [{voice_settings['name']}]: {text}")
-    
-    # If voice is disabled, just use system TTS
+    # If voice is disabled, just print the text
     if not voice_enabled:
+        print(f"TARS: {text}")
+        return
+        
+    # Use the specified voice style or default to current voice ID
+    voice_id = VOICE_STYLES.get(voice_style, eleven_voice_id) if voice_style else eleven_voice_id
+    
+    # Generate a cache key based on the voice and text
+    cache_key = f"{voice_id}:{text}"
+    
+    # Check if we already have this audio cached
+    if cache_key in voice_cache:
+        if cache_only:
+            return  # Exit if we're just preloading
+            
+        # Print the text while playing audio for better UX
+        print(f"TARS: {text}")
+        
+        # Play the cached audio
         try:
-            # Use macOS built-in TTS
-            subprocess.run(["say", text], stderr=subprocess.DEVNULL)
-        except:
-            pass  # If system TTS fails, we already printed the text
+            play_audio_bytes(voice_cache[cache_key])
+            return
+        except Exception as e:
+            print(f"Error playing cached audio: {e}")
+            # Fall through to regenerate the audio
+    
+    # Analyze tone to determine appropriate voice settings
+    tone = analyze_text_tone(text)
+    
+    # Determine dynamic voice settings based on content analysis
+    voice_settings = get_dynamic_voice_settings(text, tone)
+    
+    # If this is a cache-only call and we don't have it cached, generate it
+    if cache_only:
+        try:
+            audio = elevenlabs_client.text_to_speech.convert(
+                text=text,
+                voice_id=voice_id,
+                model_id="eleven_monolingual_v1",
+                output_format="mp3_44100_128",
+                voice_settings=voice_settings
+            )
+            audio_data = b''
+            for chunk in audio:
+                if chunk:
+                    audio_data += chunk
+            voice_cache[cache_key] = audio_data
+        except Exception as e:
+            print(f"Error caching voice response: {e}")
         return
     
+    # Otherwise, proceed with normal speech generation
+    start_time = time.time()
+    
+    # Print the text first for immediate feedback
+    print(f"TARS: {text}")
+    
     try:
-        # Clean up any previous audio processes
-        subprocess.run(["pkill", "afplay"], stderr=subprocess.DEVNULL)
+        # Pre-process text for more natural pauses and tone variations
+        processed_text = add_natural_pauses(text)
         
-        # Use ElevenLabs API
-        voice_id = voice_settings["voice_id"]
-        if not voice_id:
-            voice_id = eleven_voice_id
-        
-        # Simple voice settings
-        voice_settings_obj = {
-            "stability": voice_settings["stability"],
-            "similarity_boost": voice_settings["similarity_boost"]
-        }
-        
-        # Generate audio
+        # Try to use ElevenLabs API
         audio = elevenlabs_client.text_to_speech.convert(
-            text=text,
+            text=processed_text,
             voice_id=voice_id,
             model_id="eleven_monolingual_v1",
             output_format="mp3_44100_128",
-            voice_settings=voice_settings_obj
+            voice_settings=voice_settings
         )
         
-        # Write to file directly
-        with open("voice.mp3", "wb") as f:
-            for chunk in audio:
-                if chunk:
-                    f.write(chunk)
+        audio_data = b''
+        for chunk in audio:
+            if chunk:
+                audio_data += chunk
+                
+        # Cache the audio data for future use
+        voice_cache[cache_key] = audio_data
         
         # Play the audio
-        if os.path.exists("voice.mp3") and os.path.getsize("voice.mp3") > 100:
-            subprocess.run(["afplay", "voice.mp3"])
+        play_audio_bytes(audio_data)
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        if generation_time > 2:
+            print(f"Voice generation took {generation_time:.2f} seconds")
             
-            # Clean up
-            try:
-                os.remove("voice.mp3")
-            except:
-                pass
-                
     except Exception as e:
-        print(f"Voice generation error: {e}")
+        print(f"Error generating voice: {e}")
+        print("Falling back to system TTS...")
+        
+        # Fallback to system TTS
         try:
-            # Fall back to system TTS
-            subprocess.run(["say", text])
-        except:
-            pass  # Already printed the text
+            generate_system_tts(text)
+        except Exception as tts_error:
+            print(f"System TTS also failed: {tts_error}")
+            # At this point, we've already printed the text, so user can read it
+
+def get_dynamic_voice_settings(text, tone):
+    """Generate dynamic voice settings based on content and desired tone"""
+    # Base settings with good defaults
+    settings = {
+        "stability": 0.35,
+        "similarity_boost": 0.75,
+        "style": 0.15,
+        "use_speaker_boost": True
+    }
+    
+    # Adjust settings based on tone
+    if tone == "excited":
+        settings["stability"] = 0.25  # Less stability for more expressiveness
+        settings["style"] = 0.25      # More style variation
+    elif tone == "serious":
+        settings["stability"] = 0.45  # More stability for serious content
+        settings["style"] = 0.05      # Less style variation
+    elif tone == "thoughtful":
+        settings["stability"] = 0.40  # More stability for thoughtful content
+        settings["style"] = 0.10      # Moderate style
+    elif tone == "humorous":
+        settings["stability"] = 0.30  # Less stability for humor
+        settings["style"] = 0.30      # More style for humor
+    
+    # Add slight random variation to make each response unique
+    settings["stability"] += np.random.uniform(-0.05, 0.05)
+    settings["similarity_boost"] += np.random.uniform(-0.05, 0.05)
+    settings["style"] += np.random.uniform(-0.05, 0.05)
+    
+    # Ensure values remain in valid ranges
+    settings["stability"] = max(0.0, min(1.0, settings["stability"]))
+    settings["similarity_boost"] = max(0.0, min(1.0, settings["similarity_boost"]))
+    settings["style"] = max(0.0, min(1.0, settings["style"]))
+    
+    return settings
+
+def add_natural_pauses(text):
+    """Add natural pauses, emphasis and tone variations to make speech flow more naturally"""
+    # First, analyze the emotional tone of the text
+    tone = analyze_text_tone(text)
+    
+    # Replace periods with slight pause
+    text = text.replace(". ", ". <break time='300ms'/> ")
+    
+    # Add subtle pause after commas
+    text = text.replace(", ", ", <break time='150ms'/> ")
+    
+    # Add subtle pause for question marks and exclamation points
+    text = text.replace("? ", "? <break time='350ms'/> ")
+    text = text.replace("! ", "! <break time='300ms'/> ")
+    
+    # Add variation for questions
+    if "?" in text:
+        text = f"<prosody pitch='+15%' rate='95%'>{text}</prosody>"
+    
+    # Add emphasis to important words
+    for word in ["important", "critical", "significant", "never", "always", "must"]:
+        text = re.sub(f"\\b{word}\\b", f"<emphasis level='strong'>{word}</emphasis>", text, flags=re.IGNORECASE)
+    
+    # Add tone variation based on detected emotion
+    if tone == "excited":
+        text = f"<prosody pitch='+10%' rate='110%'>{text}</prosody>"
+    elif tone == "serious":
+        text = f"<prosody pitch='-5%' rate='95%'>{text}</prosody>"
+    elif tone == "thoughtful":
+        text = f"<prosody pitch='-2%' rate='90%'>{text}</prosody>"
+    elif tone == "humorous":
+        text = f"<prosody pitch='+7%' rate='105%'>{text}</prosody>"
+    
+    # Add random pitch variations to some sentences for more natural sound
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    if len(sentences) > 1:
+        for i in range(len(sentences)):
+            # Randomly vary some sentences (30% chance)
+            if np.random.random() < 0.3 and not sentences[i].startswith("<prosody"):
+                pitch_var = np.random.choice(['-5%', '+5%', '-3%', '+3%', '-7%', '+7%'])
+                rate_var = np.random.choice(['95%', '105%', '98%', '102%', '90%', '110%'])
+                sentences[i] = f"<prosody pitch='{pitch_var}' rate='{rate_var}'>{sentences[i]}</prosody>"
+        
+        # Rebuild text with variations
+        text = " ".join(sentences)
+    
+    return text
+
+def analyze_text_tone(text):
+    """Analyze the emotional tone of text to apply appropriate speech variations"""
+    text_lower = text.lower()
+    
+    # Check for different emotional indicators
+    if any(word in text_lower for word in ["excited", "amazing", "fantastic", "awesome", "wow", "incredible"]):
+        return "excited"
+    elif any(word in text_lower for word in ["serious", "important", "warning", "caution", "danger"]):
+        return "serious"
+    elif any(word in text_lower for word in ["think", "consider", "perhaps", "maybe", "possibly"]):
+        return "thoughtful"
+    elif any(word in text_lower for word in ["funny", "joke", "humor", "laugh", "amusing", "kidding"]):
+        return "humorous"
+    
+    # Default tone
+    return "neutral"
 
 # Add a WakeWordDetector class
 class WakeWordDetector:
-    def __init__(self, keyword="hey tars", sensitivity=0.5):
-        self.keyword = keyword
+    """Wake word detection for activating TARS with voice"""
+    
+    def __init__(self, wake_words=["hey tars", "tars", "computer"], sensitivity=0.6, callback=None):
+        """
+        Initialize the wake word detector
+        
+        Args:
+            wake_words: List of wake words to listen for
+            sensitivity: Detection sensitivity (0.0-1.0)
+            callback: Function to call when wake word is detected
+        """
+        self.wake_words = wake_words
         self.sensitivity = sensitivity
+        self.callback = callback
+        self.is_running = False
         self.porcupine = None
-        self.stream = None
-        self.running = False
-        self.detected_callback = None
-        self.detection_thread = None
+        self.audio = None
+        self.wake_word_thread = None
         
-        # Initialize Porcupine
-        self._initialize_porcupine()
-        
-    def _initialize_porcupine(self):
-        """Initialize the Porcupine wake word engine"""
+        # Check if we have an access key for Porcupine
+        self.access_key = os.getenv('PICOVOICE_ACCESS_KEY')
+        if not self.access_key:
+            print("Warning: No PICOVOICE_ACCESS_KEY found. Wake word detection requires an API key.")
+            print("Get a free key from https://console.picovoice.ai/")
+            print("Then add PICOVOICE_ACCESS_KEY to your .env file")
+            self.is_available = False
+            return
+            
         try:
             # First check if we have a custom model file
-            custom_keyword_path = os.path.join(os.getcwd(), "hey_tars_wasm.ppn")
-            if os.path.exists(custom_keyword_path):
+            custom_keyword_paths = []
+            hey_tars_path = os.path.join(os.getcwd(), "hey_tars_wasm.ppn")
+            tars_path = os.path.join(os.getcwd(), "tars_wasm.ppn")
+            
+            if os.path.exists(hey_tars_path):
+                custom_keyword_paths.append(hey_tars_path)
+            
+            if os.path.exists(tars_path):
+                custom_keyword_paths.append(tars_path)
+                
+            if custom_keyword_paths:
                 try:
-                    # Try to use the custom "Hey TARS" model file
+                    # Use available custom models
+                    sensitivities = [self.sensitivity] * len(custom_keyword_paths)
                     self.porcupine = pvporcupine.create(
-                        access_key=os.getenv('PICOVOICE_ACCESS_KEY'),
-                        keyword_paths=[custom_keyword_path],
-                        sensitivities=[self.sensitivity]
+                        access_key=self.access_key,
+                        keyword_paths=custom_keyword_paths,
+                        sensitivities=sensitivities
                     )
-                    print(f"Wake word detector initialized with custom 'Hey TARS' model!")
+                    print(f"Wake word detector initialized with {len(custom_keyword_paths)} custom model(s)!")
                 except Exception as model_error:
-                    print(f"Error loading custom model: {model_error}")
+                    print(f"Error loading custom models: {model_error}")
                     print("Falling back to default wake words.")
                     # Fall back to built-in keywords if custom model fails
                     self.porcupine = pvporcupine.create(
-                        access_key=os.getenv('PICOVOICE_ACCESS_KEY'),
-                        keywords=["porcupine", "computer"],
-                        sensitivities=[self.sensitivity, self.sensitivity]
+                        access_key=self.access_key,
+                        keywords=["jarvis", "computer", "porcupine"],
+                        sensitivities=[self.sensitivity, self.sensitivity, self.sensitivity]
                     )
-                    print(f"Wake word detection initialized with default keywords.")
             else:
                 # Fall back to built-in keywords if no custom model found
                 self.porcupine = pvporcupine.create(
-                    access_key=os.getenv('PICOVOICE_ACCESS_KEY'),
-                    keywords=["porcupine", "computer"],
-                    sensitivities=[self.sensitivity, self.sensitivity]
+                    access_key=self.access_key,
+                    keywords=["jarvis", "computer", "porcupine"],
+                    sensitivities=[self.sensitivity, self.sensitivity, self.sensitivity]
                 )
-                print(f"Wake word detection initialized. Say 'Porcupine' or 'Computer' to activate TARS.")
-                print(f"(Looking for custom 'Hey TARS' model at: {custom_keyword_path})")
-            return True
+                print(f"Custom wake word models not found. Using default keywords.")
+                print(f"For custom wake words, place models in the project directory:")
+                print(f"- hey_tars_wasm.ppn: For 'Hey TARS'")
+                print(f"- tars_wasm.ppn: For 'TARS'")
+            
+            self.is_available = True
+            
+            # Set up PyAudio
+            self.audio = pyaudio.PyAudio()
+            
         except Exception as e:
-            print(f"Error initializing wake word detection: {e}")
-            print("Wake word detection will be disabled.")
-            return False
-    
-    def _audio_callback(self, indata, frames, time, status):
-        """Callback for processing audio data"""
-        if status:
-            print(f"Audio callback status: {status}")
-            
-        if self.porcupine is None:
-            return
-            
-        # Convert audio to the format Porcupine expects
-        pcm = np.frombuffer(indata, dtype=np.int16)
-        
-        # Process audio with Porcupine
-        try:
-            keyword_index = self.porcupine.process(pcm)
-            
-            # If wake word detected (keyword_index >= 0)
-            if keyword_index >= 0:
-                if self.detected_callback:
-                    # Run the callback in a separate thread to avoid blocking
-                    threading.Thread(target=self.detected_callback).start()
-        except Exception as e:
-            print(f"Error processing audio for wake word: {e}")
+            print(f"Error initializing wake word detector: {e}")
+            self.is_available = False
     
     def start(self, detected_callback=None):
-        """Start listening for wake word"""
-        if self.porcupine is None:
-            print("Wake word detection not available.")
+        """Start listening for wake word in a background thread"""
+        if not self.is_available:
+            print("Wake word detection not available")
             return False
             
-        self.detected_callback = detected_callback
-        self.running = True
-        
-        try:
-            self.stream = sd.InputStream(
-                samplerate=self.porcupine.sample_rate,
-                channels=1,
-                dtype=np.int16,
-                blocksize=self.porcupine.frame_length,
-                callback=self._audio_callback
-            )
-            self.stream.start()
-            print("Wake word detection started")
+        if self.is_running:
+            print("Wake word detector already running")
             return True
-        except Exception as e:
-            print(f"Error starting wake word detection: {e}")
-            self.running = False
-            return False
+        
+        # Update callback if provided
+        if detected_callback:
+            self.callback = detected_callback
+            
+        self.is_running = True
+        self.wake_word_thread = threading.Thread(target=self._listen_for_wake_word)
+        self.wake_word_thread.daemon = True
+        self.wake_word_thread.start()
+        return True
     
     def stop(self):
         """Stop listening for wake word"""
-        self.running = False
+        self.is_running = False
+        if self.wake_word_thread:
+            self.wake_word_thread.join(timeout=2.0)
+            self.wake_word_thread = None
+    
+    def _listen_for_wake_word(self):
+        """Background thread that listens for wake word"""
+        # Create an input stream to read audio
+        stream = self.audio.open(
+            rate=self.porcupine.sample_rate,
+            channels=1,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=self.porcupine.frame_length
+        )
         
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
-            
-        print("Wake word detection stopped")
+        print("🎤 Listening for wake word...")
+        
+        try:
+            while self.is_running:
+                # Read audio frame
+                pcm = stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
+                
+                # Process with Porcupine
+                result = self.porcupine.process(pcm)
+                
+                # If wake word detected (result >= 0 indicates which wake word)
+                if result >= 0:
+                    print(f"🎯 Wake word detected! ({result})")
+                    # Run the callback function if provided
+                    if self.callback:
+                        self.callback()
+                    # Small pause to avoid re-triggering immediately
+                    time.sleep(1.0)
+                    
+        except Exception as e:
+            print(f"Error in wake word detection: {e}")
+        finally:
+            # Clean up
+            if stream:
+                stream.close()
     
     def __del__(self):
-        """Clean up resources"""
+        """Clean up resources when object is destroyed"""
         self.stop()
-        
         if self.porcupine:
             self.porcupine.delete()
 
 # Add a function to change voice style
 def set_voice_style(style_name):
     """Change TARS voice style"""
-    global current_voice_style
+    global current_voice_style, eleven_voice_id
     
     if style_name in VOICE_STYLES:
         current_voice_style = style_name
         style_info = VOICE_STYLES[style_name]
-        return f"Voice style changed to {style_info['name']}. {style_info['description']}"
+        eleven_voice_id = style_info
+        return f"Voice style changed to {style_info}. {style_info}"
     else:
         available_styles = ", ".join(VOICE_STYLES.keys())
         return f"Voice style '{style_name}' not found. Available styles: {available_styles}"
 
 # Update chat_with_ai function to include voice style commands
-def chat_with_ai():
-    recorder = AudioRecorder()
-    conversation = ConversationManager()
-    
-    # Initialize wake word detector
-    wake_word_detector = WakeWordDetector()
-    wake_word_active = False
-    
-    if voice_enabled:
-        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled.")
+def chat_with_ai(user_input):
+    """Process user input and get response from AI with improved naturalness"""
+    global current_user, eleven_voice_id, current_voice_style, voice_enabled
+
+    # Check for system commands
+    if user_input.lower() == "voice off":
+        toggle_voice(False)
+        return "Voice output disabled"
         
-        # Preload common responses in background if voice is enabled
-        def preload_voice_responses():
-            for text in ["I'm not sure I understand that.", "Could you clarify?", "Processing your request."]:
-                try:
-                    audio = elevenlabs_client.text_to_speech.convert(
-                        text=text,
-                        voice_id=eleven_voice_id,
-                        model_id="eleven_monolingual_v1",
-                        output_format="mp3_44100_128"
-                    )
-                    audio_data = b''
-                    for chunk in audio:
-                        if chunk:
-                            audio_data += chunk
-                    voice_cache[f"default:{text}"] = audio_data
-                except Exception as e:
-                    print(f"Error preloading voice responses: {e}")
+    if user_input.lower() == "voice on":
+        toggle_voice(True)
+        return "Voice output enabled"
         
-        # Start preloading voice responses
-        executor.submit(preload_voice_responses)
-    else:
-        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled. (Text-only mode)")
-    
-    # Check if we have voice profiles
-    if voice_recognition.has_users():
-        print(f"Voice recognition enabled with {len(voice_recognition.profiles)} user profiles.")
-    else:
-        print("No voice profiles found. Would you like to test the microphone first? (test/enroll/skip)")
-        choice = input().lower()
-        if choice.startswith('t'):
-            # Run a quick microphone test
-            test_audio_capture(recorder)
-        elif choice.startswith('e'):
-            print("Please enter your name:")
-            name = input().strip()
-            if name:
-                recorder.start_enrollment(name, num_samples=3)
-        # Skip otherwise
-    
-    print("\nPress Enter to start recording, or type your message directly.")
-    print("Type 'quit' to exit, 'enroll' to add a voice profile, or 'test' to test your microphone.")
-    print("Wake word detection enabled - say 'Porcupine' or 'Computer' to activate TARS hands-free.")
-    
-    # Additional commands
-    print("Additional commands:")
-    print("- 'enroll': Add a new voice profile")
-    print("- 'who': Check which user is currently recognized")
-    print("- 'reset': Reset user recognition for this session")
-    print("- 'test': Test your microphone")
-    print("- 'wake': Toggle wake word detection")
-    print("- 'voice list': Show available voice styles")
-    print("- 'voice [style]': Change TARS voice style (default, friendly, professional, expressive)")
-    
-    # Check for previous conversations
-    memory_context = conversation.memory.get_memory_context()
-    if "Recent conversations" in memory_context:
-        print("TARS: I've loaded our previous conversations.")
-    
-    # Define wake word callback
-    def on_wake_word_detected():
-        nonlocal wake_word_active
+    if user_input.lower() == "voice list":
+        voice_list = ", ".join(VOICE_STYLES.keys())
+        return f"Available voice styles: {voice_list}"
         
-        if not wake_word_active:
-            return
-            
-        # Play a short acknowledgment sound
-        print("\nWake word detected! Listening...")
-        speak("Yes?")  # Keep it simple
-        
-        # Start recording automatically
-        recorder.start_recording()
-        audio_data = recorder.get_audio_data()
-        
-        if audio_data:
-            # Try to recognize the speaker
-            conversation.recognize_user(audio_data)
-            current_user = voice_recognition.get_current_user()
-            
-            # Start transcription
-            future = executor.submit(process_audio_to_text, audio_data)
-            print("Processing your audio...")
-            
-            user_text = future.result()
-            
-            if user_text:
-                if current_user:
-                    print(f"{current_user} said: {user_text}")
-                else:
-                    print(f"You said: {user_text}")
-                
-                # Early acknowledgment for longer queries
-                if len(user_text.split()) > 5:
-                    print("TARS: Processing...")
-                
-                # Get AI response in background
-                response_future = executor.submit(get_response_for_text, conversation, user_text)
-                result = response_future.result()
-                
-                # Speak the response
-                speak(result["response"])
-            else:
-                print("TARS: I couldn't understand that. Please try again.")
-                speak("I couldn't understand that. Please try again.")
+    if user_input.lower().startswith("voice "):
+        style = user_input.lower().replace("voice ", "").strip()
+        if style in VOICE_STYLES:
+            current_voice_style = style
+            eleven_voice_id = VOICE_STYLES[style]
+            return f"Voice style changed to {style}"
+        else:
+            return f"Unknown voice style: {style}. Available styles: {', '.join(VOICE_STYLES.keys())}"
     
-    # Start wake word detection if available
-    if wake_word_detector.porcupine is not None:
-        wake_word_active = True
-        wake_word_detector.start(detected_callback=on_wake_word_detected)
-    
-    try:
-        while True:
-            user_input = input("\nPress Enter to speak or type your message (or 'quit'): ")
-            
-            # Check for special commands
-            if user_input.lower() == 'quit':
-                # Save session before exiting
-                conversation.save_session()
-                # Stop wake word detection
-                if wake_word_detector.porcupine is not None:
-                    wake_word_detector.stop()
-                print("\nTARS: Powering down. Session saved to memory.")
-                break
-            elif user_input.lower() == 'enroll':
-                print("Please enter the name for the new voice profile:")
-                name = input().strip()
-                if name:
-                    recorder.start_enrollment(name, num_samples=3)
-                continue
-            elif user_input.lower() == 'who':
-                current_user = voice_recognition.get_current_user()
-                if current_user:
-                    print(f"TARS: I currently recognize you as {current_user}.")
-                else:
-                    print("TARS: I haven't recognized your voice yet in this session.")
-                continue
-            elif user_input.lower() == 'reset':
-                voice_recognition.current_user = None
-                conversation.recognized_user = None
-                print("TARS: Voice recognition reset for this session.")
-                continue
-            elif user_input.lower() == 'test':
-                test_audio_capture(recorder)
-                continue
-            elif user_input.lower() == 'wake':
-                # Toggle wake word detection
-                if wake_word_detector.porcupine is not None:
-                    wake_word_active = not wake_word_active
-                    if wake_word_active:
-                        print("TARS: Wake word detection enabled.")
-                    else:
-                        print("TARS: Wake word detection disabled.")
-                else:
-                    print("TARS: Wake word detection is not available.")
-                continue
-            elif user_input.lower() == 'voice list':
-                # List available voice styles
-                print("Available voice styles: (Note: Voice styles temporarily simplified for stability)")
-                for style_name, style_info in VOICE_STYLES.items():
-                    print(f"- {style_name}: {style_info['name']} - {style_info['description']}")
-                continue
-            elif user_input.lower().startswith('voice ') and len(user_input.split()) > 1:
-                # Change voice style
-                style_name = user_input.split(maxsplit=1)[1].strip().lower()
-                if style_name == 'list':
-                    # List available voice styles
-                    print("Available voice styles: (Note: Using default style for stability)")
-                    for style_name, style_info in VOICE_STYLES.items():
-                        print(f"- {style_name}: {style_info['name']} - {style_info['description']}")
-                else:
-                    response = set_voice_style(style_name)
-                    print(response)
-                    speak("Voice style changed. This is currently using the default voice for stability.")
-                continue
-                
-            # If user typed something instead of just pressing Enter to speak
-            if user_input.strip() and user_input.lower() not in ['quit', 'enroll', 'who', 'reset', 'test', 'wake']:
-                print(f"You typed: {user_input}")
-                
-                # Get AI response in background
-                response_future = executor.submit(get_response_for_text, conversation, user_input)
-                print("TARS is thinking...")
-                
-                result = response_future.result()
-                
-                # Use the speak function which now handles text-only mode
-                speak(result["response"], result["style"])
-                continue
-                
-            # Only try to record if voice is enabled, otherwise prompt for text input
-            if not voice_enabled:
-                print("Voice input is disabled. Please type your message instead.")
-                continue
-                
-            recorder.start_recording()
-            audio_data = recorder.get_audio_data()
-            
-            if audio_data:
-                # Try to recognize the speaker first
-                conversation.recognize_user(audio_data)
-                current_user = voice_recognition.get_current_user()
-                
-                # Start transcription immediately
-                future = executor.submit(process_audio_to_text, audio_data)
-                
-                # Show processing indicator
-                print("Processing your audio...")
-                
-                user_text = future.result()
-                
-                if user_text:
-                    if current_user:
-                        print(f"{current_user} said: {user_text}")
-                    else:
-                        print(f"You said: {user_text}")
-                    
-                    # Early acknowledgment - makes the system feel more responsive
-                    if len(user_text.split()) > 5:  # Only for longer queries
-                        print("TARS: Processing...")
-                    
-                    # Get AI response in background
-                    response_future = executor.submit(get_response_for_text, conversation, user_text)
-                    
-                    result = response_future.result()
-                    
-                    # Use the speak function which handles text-only mode
-                    speak(result["response"], result["style"])
-                else:
-                    print("TARS: I couldn't understand that. Please try again.")
-            else:
-                print("TARS: I'm detecting a distinct lack of audio. Let's try that again.")
-    except KeyboardInterrupt:
-        # Also save session on CTRL+C exit
-        conversation.save_session()
-        # Stop wake word detection
-        if wake_word_detector.porcupine is not None:
-            wake_word_detector.stop()
-        print("\nTARS: Session saved to memory. Shutting down.")
+    if user_input.lower() == "exit" or user_input.lower() == "quit":
+        global running
+        running = False
+        return "Shutting down. Goodbye!"
+        
+    # Handle normal conversation with AI
+    ai_response = get_ai_response(user_input, current_user)
+    return ai_response
 
 # Add a function to test audio capture and feature extraction
 def test_audio_capture(recorder):
@@ -1747,5 +1681,372 @@ def transcribe_audio(audio_data):
         print(f"Transcription error: {str(e)}")
         raise
 
+# Add missing utility functions
+
+def toggle_voice(enable):
+    """Enable or disable voice output"""
+    global voice_enabled
+    voice_enabled = enable
+    return True
+
+def generate_system_tts(text):
+    """Generate system TTS using macOS 'say' command"""
+    try:
+        subprocess.run(["say", text], check=True)
+        return True
+    except Exception as e:
+        print(f"System TTS error: {e}")
+        return False
+
+def play_audio_bytes(audio_data):
+    """Play audio from bytes data"""
+    try:
+        # Save to a temporary file and play
+        with NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
+            
+        # Play using mpg123 if available, otherwise use other methods
+        try:
+            # Use subprocess with start_new_session on Unix systems
+            subprocess.run(["mpg123", "-q", temp_path], check=True)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            try:
+                # Try using mpg321 as alternative
+                subprocess.run(["mpg321", "-q", temp_path], check=True)
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # Fall back to simpler method that works on most systems
+                import platform
+                if platform.system() == "Darwin":
+                    # macOS
+                    subprocess.run(["afplay", temp_path], check=True)
+                elif platform.system() == "Windows":
+                    # Windows
+                    os.startfile(temp_path)  # This is blocking
+                else:
+                    # Linux
+                    subprocess.run(["xdg-open", temp_path], check=True)
+                    
+        # Clean up temp file after playing
+        os.remove(temp_path)
+        return True
+    except Exception as e:
+        print(f"Error playing audio: {e}")
+        return False
+
+def get_ai_response(user_input, current_user=None):
+    """Process user input and get response from the AI"""
+    global conversation_manager
+    
+    # Create conversation manager if not already created
+    if 'conversation_manager' not in globals():
+        global conversation_manager
+        conversation_manager = ConversationManager()
+    
+    # Process the input and get response
+    return conversation_manager.get_ai_response(user_input)
+
+def init_ai_services():
+    """Initialize all AI services required for TARS to operate"""
+    # Most service initialization is already done at module level
+    # This function ensures all required services are ready
+    
+    # Check if OpenAI API key is set
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    if not openai_api_key:
+        print("WARNING: OPENAI_API_KEY not found in environment variables")
+        print("TARS needs an OpenAI API key to function")
+        print("Please set this in your .env file")
+        return False
+    
+    # Test OpenAI connection with a simple request
+    try:
+        print("Testing OpenAI API connection...")
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Test"}],
+            max_tokens=5
+        )
+        print("OpenAI API connection successful")
+    except Exception as e:
+        print(f"ERROR: Could not connect to OpenAI API: {e}")
+        print("TARS needs a working OpenAI API connection")
+        return False
+    
+    # Create memory directories if they don't exist
+    for directory in [MEMORY_DIR, SESSIONS_DIR, VOICE_PROFILES_DIR]:
+        directory.mkdir(exist_ok=True, parents=True)
+    
+    # Initialize global conversation manager
+    global conversation_manager
+    conversation_manager = ConversationManager()
+    
+    return True
+
+# Add this new function before the main loop
+def make_response_conversational(response, user_input):
+    """Make AI responses more conversational and human-like"""
+    # Don't modify very short responses
+    if len(response.split()) < 5:
+        return response
+        
+    # Occasionally add conversational starters based on input type
+    starters = []
+    if "?" in user_input:  # It's a question
+        starters = ["Well, ", "Hmm, ", "Let's see... ", "Actually, ", ""]
+    elif any(w in user_input.lower() for w in ["thanks", "thank", "appreciate"]):
+        starters = ["No problem. ", "Happy to help. ", "Anytime. ", "Of course. ", ""]
+    else:
+        starters = ["", "You know, ", "So, ", "Well, ", "Right, "]
+    
+    starter = np.random.choice(starters, p=[0.5, 0.125, 0.125, 0.125, 0.125])
+    
+    # Add small speech disfluencies occasionally (15% chance)
+    if np.random.random() < 0.15 and not starter:
+        disfluencies = ["Um, ", "Ah, ", "Hmm, ", "So, "]
+        response = np.random.choice(disfluencies) + response
+        
+    # Add the starter if we have one and didn't add a disfluency
+    if starter and not response.startswith(("Um", "Ah", "Hmm", "So")):
+        response = starter + response
+        
+    return response
+
+# Add the main loop function to the end of the file
+
+def main_loop():
+    """Main program loop for TARS"""
+    global running, current_user, voice_enabled
+    
+    # Initialize voice recognition and conversation systems
+    recorder = AudioRecorder()
+    conversation = ConversationManager()
+    
+    # Initialize wake word detector if available
+    wake_word_detector = WakeWordDetector()
+    wake_word_active = False
+    
+    # Print initialization messages
+    if voice_enabled:
+        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled.")
+        
+        # Preload common responses in background
+        def preload_voice_responses():
+            for text in ["I'm not sure I understand that.", "Could you clarify?", "Processing your request."]:
+                try:
+                    speak(text, cache_only=True)
+                except Exception as e:
+                    print(f"Error preloading voice responses: {e}")
+        
+        # Start preloading voice responses
+        executor.submit(preload_voice_responses)
+    else:
+        print("\nTARS: Initialized and ready. Humor setting at 75%. Internet access enabled. (Text-only mode)")
+    
+    # Check for voice profiles
+    if voice_recognition.has_users():
+        print(f"Voice recognition enabled with {len(voice_recognition.profiles)} user profiles.")
+    else:
+        print("No voice profiles found. Would you like to test the microphone first? (test/enroll/skip)")
+        choice = input().lower()
+        if choice.startswith('t'):
+            # Run a quick microphone test
+            test_audio_capture(recorder)
+        elif choice.startswith('e'):
+            print("Please enter your name:")
+            name = input().strip()
+            if name:
+                recorder.start_enrollment(name, num_samples=3)
+    
+    print("\nPress Enter to start recording, or type your message directly.")
+    print("Type 'quit' to exit, 'enroll' to add a voice profile, or 'test' to test your microphone.")
+    
+    if wake_word_detector.is_available:
+        print("Wake word detection available - say 'Hey TARS', 'TARS', 'Computer', 'Jarvis', or 'Porcupine' to activate hands-free.")
+    
+    # Print available commands
+    print("Available commands:")
+    print("- 'enroll': Add a new voice profile")
+    print("- 'who': Check which user is currently recognized")
+    print("- 'reset': Reset user recognition for this session")
+    print("- 'test': Test your microphone")
+    print("- 'wake': Toggle wake word detection")
+    print("- 'voice list': Show available voice styles")
+    print("- 'voice [style]': Change TARS voice style")
+    print("- 'voice on/off': Enable/disable voice output")
+    
+    # Check for previous conversations
+    memory_context = conversation.memory.get_memory_context()
+    if "Recent conversations" in memory_context:
+        print("TARS: I've loaded our previous conversations.")
+    
+    # Define wake word callback
+    def on_wake_word_detected():
+        nonlocal wake_word_active
+        
+        if not wake_word_active:
+            return
+            
+        # Play a short acknowledgment sound with more natural variation
+        print("\nWake word detected! Listening...")
+        acknowledgments = ["Yes?", "I'm here.", "How can I help?", "What's up?"]
+        speak(np.random.choice(acknowledgments))  # More natural acknowledgments
+        
+        # Start recording automatically
+        recorder.start_recording()
+        audio_data = recorder.get_audio_data()
+        
+        if audio_data:
+            # Try to recognize the speaker
+            conversation.recognize_user(audio_data)
+            current_user = voice_recognition.get_current_user()
+            
+            # Start transcription
+            future = executor.submit(process_audio_to_text, audio_data)
+            print("Processing your audio...")
+            
+            user_text = future.result()
+            
+            if user_text:
+                if current_user:
+                    print(f"{current_user} said: {user_text}")
+                else:
+                    print(f"You said: {user_text}")
+                
+                # Process the input
+                response = chat_with_ai(user_text)
+                
+                # Speak the response
+                speak(response)
+            else:
+                # More varied error responses
+                errors = [
+                    "I couldn't understand that. Could you try again?",
+                    "Sorry, I didn't catch that. Mind repeating?",
+                    "That didn't come through clearly. One more time?"
+                ]
+                error_msg = np.random.choice(errors)
+                print(f"TARS: {error_msg}")
+                speak(error_msg)
+    
+    # Start wake word detection if available
+    if wake_word_detector.is_available:
+        wake_word_active = True
+        wake_word_detector.start(detected_callback=on_wake_word_detected)
+    
+    # Main loop
+    running = True
+    try:
+        while running:
+            user_input = input("\nPress Enter to speak or type your message (or 'quit'): ")
+            
+            # Check for special commands
+            if user_input.lower() == 'quit':
+                # Save session before exiting
+                conversation.save_session()
+                # Stop wake word detection
+                if wake_word_detector.is_available:
+                    wake_word_detector.stop()
+                print("\nTARS: Powering down. Session saved to memory.")
+                break
+            elif user_input.lower() == 'enroll':
+                print("Please enter the name for the new voice profile:")
+                name = input().strip()
+                if name:
+                    recorder.start_enrollment(name, num_samples=3)
+                continue
+            elif user_input.lower() == 'who':
+                current_user = voice_recognition.get_current_user()
+                if current_user:
+                    print(f"TARS: I currently recognize you as {current_user}.")
+                else:
+                    print("TARS: I haven't recognized your voice yet in this session.")
+                continue
+            elif user_input.lower() == 'reset':
+                voice_recognition.current_user = None
+                conversation.recognized_user = None
+                print("TARS: Voice recognition reset for this session.")
+                continue
+            elif user_input.lower() == 'test':
+                test_audio_capture(recorder)
+                continue
+            elif user_input.lower() == 'wake':
+                # Toggle wake word detection
+                if wake_word_detector.is_available:
+                    wake_word_active = not wake_word_active
+                    if wake_word_active:
+                        wake_word_detector.start(detected_callback=on_wake_word_detected)
+                        print("TARS: Wake word detection enabled.")
+                    else:
+                        wake_word_detector.stop()
+                        print("TARS: Wake word detection disabled.")
+                else:
+                    print("TARS: Wake word detection is not available.")
+                continue
+                
+            # If user typed something
+            if user_input.strip():
+                if user_input.lower() in ['quit', 'enroll', 'who', 'reset', 'test', 'wake']:
+                    continue
+                    
+                print(f"You typed: {user_input}")
+                
+                # Process the input
+                response = chat_with_ai(user_input)
+                
+                # Speak the response
+                speak(response)
+                continue
+                
+            # Voice recording for empty input (pressing Enter)
+            if not voice_enabled:
+                print("Voice input is disabled. Please type your message instead.")
+                continue
+                
+            # Record audio
+            recorder.start_recording()
+            audio_data = recorder.get_audio_data()
+            
+            if audio_data:
+                # Try to recognize the speaker
+                conversation.recognize_user(audio_data)
+                current_user = voice_recognition.get_current_user()
+                
+                # Start transcription immediately
+                future = executor.submit(process_audio_to_text, audio_data)
+                
+                # Show processing indicator
+                print("Processing your audio...")
+                
+                user_text = future.result()
+                
+                if user_text:
+                    if current_user:
+                        print(f"{current_user} said: {user_text}")
+                    else:
+                        print(f"You said: {user_text}")
+                    
+                    # Process the input
+                    response = chat_with_ai(user_text)
+                    
+                    # Speak the response
+                    speak(response)
+                else:
+                    print("TARS: I couldn't understand that. Please try again.")
+            else:
+                print("TARS: I'm detecting a distinct lack of audio. Let's try that again.")
+    except KeyboardInterrupt:
+        # Save session on CTRL+C exit
+        conversation.save_session()
+        # Stop wake word detection
+        if wake_word_detector.is_available:
+            wake_word_detector.stop()
+        print("\nTARS: Session saved to memory. Shutting down.")
+
+# Update the main section to call the main loop
 if __name__ == "__main__":
-    chat_with_ai() 
+    # Initialize the required services
+    init_ai_services()
+    
+    # Run the main program loop
+    main_loop() 
