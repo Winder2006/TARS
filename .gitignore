@@ -1,38 +1,10 @@
-# Environment variables
-.env
+# Ignore logs
+*.log
 
-# Python
+# Ignore cache and temp files
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environment
-venv/
-ENV/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
 .DS_Store
-Thumbs.db 
+memory/

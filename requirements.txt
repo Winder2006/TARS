@@ -8,3 +8,10 @@ python-dotenv>=0.19.0
 keyboard>=0.13.5
 beautifulsoup4>=4.9.3
 requests>=2.25.1 
+
+# Optional dependencies - install if your platform supports them
+# pvporcupine>=3.0.0 ; platform_machine != "arm64" or platform_system != "Linux"
+# pyaudio>=0.2.11 ; platform_machine != "arm64" or platform_system != "Linux"
+
+# For Raspberry Pi 5 support, consider alternate dependencies:
+# picovoice>=2.1.0 ; platform_machine == "arm64" and platform_system == "Linux" 
