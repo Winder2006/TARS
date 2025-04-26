@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
 import os
 import sys
-import time
+import re
 import json
-import base64
-import queue
-import pickle
-import shutil
-import random
+import time
 import logging
-import hashlib
-import fnmatch
-import tempfile
-import platform
-import requests
-import mimetypes
+import random
 import threading
-import concurrent.futures
+import queue
+import datetime
+import hashlib
+import subprocess
+import argparse
+import platform
+import types
+from datetime import datetime, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
+from continuous_learning import get_learning_system
+from unittest.mock import Mock
+import openai
+from openai import OpenAI
+from meta_learning import get_response_adaptations
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Import necessary modules
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import simpleaudio as sa
-import types
-from pathlib import Path
-from functools import lru_cache
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
-import re
-import uuid
-from typing import List, Dict, Any, Tuple, Optional, Union, Set
-import openai
-from openai import OpenAI
-from dotenv import load_dotenv
-from unittest.mock import Mock
-from knowledge_db import KnowledgeDatabase, EnhancedMemory
+import requests
+from scipy.io.wavfile import write
+
+# Check if tools are available
+TOOLS_AVAILABLE = os.getenv("ENABLE_TOOLS", "true").lower() in ["true", "1", "yes"]
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+
+# Import our continuous learning system
+from continuous_learning import get_learning_system
+from knowledge_graph import query_graph, get_user_facts
 
 # Import our custom systems
 from meta_learning import MetaLearningSystem, record_response_quality, get_response_adaptations, update_preferences
@@ -1417,393 +1423,8 @@ def populate_knowledge_graph_if_empty():
         print(f"Error populating knowledge graph: {str(e)}")
         return False
 
-def chat_with_ai(memory_system=None, rag_system=None, voice_system=None, adaptations=None):
-    """Chat with the AI assistant in a loop"""
-    global exit_flag, voice_enabled
-    
-    exit_flag = False
-    print("\n--------------------------------------------------")
-    print("TARS is ready! Type your message.")
-    print("Say 'exit' or 'quit' to end the conversation.")
-    print("Voice commands: 'voice off', 'voice on', 'voice list', 'voice [style]'")
-    print("Google Search: 'set google api key [YOUR_KEY]', 'set google cse id [YOUR_ID]'")
-    print("\nPress Enter with no text to start recording, press Enter again to stop and process.")
-    print("Press Enter at any time to interrupt TARS and start recording your next question.")
-    print("----------------------------------------")
-    
-    # Debug check of knowledge graph
-    debug_check_knowledge_graph()
-    
-    # Populate knowledge graph if empty
-    populate_knowledge_graph_if_empty()
-    
-    # Initialize conversation with history from previous session
-    conversation = []
-    if memory_system and hasattr(memory_system, 'load_conversation_history'):
-        try:
-            previous_conversation = memory_system.load_conversation_history()
-            if previous_conversation:
-                conversation = previous_conversation
-                print(f"Loaded {len(previous_conversation)} messages from previous conversation")
-        except Exception as e:
-            logging.error(f"Error loading conversation history: {str(e)}")
-    
-    # Set a default user for memory system
-    if memory_system:
-        try:
-            if hasattr(memory_system, 'current_user'):
-                # Use default or already set user
-                if memory_system.current_user == "default_user":
-                    memory_system.current_user = "Charles"
-                    logging.info(f"Using default user: {memory_system.current_user}")
-            logging.info("Memory system initialized with user")
-        except Exception as e:
-            logging.error(f"Error setting up memory system user: {str(e)}")
-            
-    while not exit_flag:
-        try:
-            # Get user input
-            user_input = get_user_input(voice_system)
-            
-            # If the program was interrupted, we might get None
-            if user_input is None:
-                continue
-                
-            # Check for exit command
-            if user_input.lower() in ["exit", "quit"]:
-                print("Goodbye!")
-                break
-                
-            # Check for voice commands
-            if user_input.lower().startswith("voice "):
-                command = user_input[6:].strip()
-                response = handle_voice_command(command)
-                print(f"TARS: {response}")
-                continue
-                
-            # Check for Google API key command
-            if user_input.lower().startswith("set google api key "):
-                api_key = user_input[18:].strip()
-                os.environ["GOOGLE_API_KEY"] = api_key
-                print(f"TARS: Google API key set. Length: {len(api_key)} characters")
-                continue
-                
-            # Check for Google CSE ID command
-            if user_input.lower().startswith("set google cse id "):
-                cse_id = user_input[17:].strip()
-                os.environ["GOOGLE_CSE_ID"] = cse_id
-                print(f"TARS: Google Custom Search Engine ID set. Value: {cse_id}")
-                continue
-        
-            # Handle memory-related commands
-            if user_input.lower() == "what do you know about me" and memory_system:
-                try:
-                    # Get user background safely - don't assume current_user attribute
-                    user_id = getattr(memory_system, 'current_user', 'default_user')
-                    
-                    # See if we can get user background
-                    if hasattr(memory_system, 'get_user_background'):
-                        background = memory_system.get_user_background(user_id)
-                        if background:
-                            formatted_info = "\n".join([f"{k}: {v}" for k, v in background.items() 
-                                                      if k != "important_messages" and v])
-                            response = f"Here's what I know about you:\n{formatted_info}"
-                        else:
-                            response = "I don't have much information about you yet."
-                    else:
-                        response = "I don't have access to user background information."
-                    
-                    # Add the interaction to memory (different systems might use different methods)
-                    if hasattr(memory_system, 'add_message'):
-                        memory_system.add_message("user", user_input)
-                        memory_system.add_message("assistant", response)
-                    elif hasattr(memory_system, 'log_interaction'):
-                        user = getattr(memory_system, 'current_user', 'default_user')
-                        memory_system.log_interaction(user, user_input, response)
-                        
-                    print(f"TARS: {response}")
-                    if voice_enabled:
-                        speak(response)
-                    continue
-                except Exception as e:
-                    logging.error(f"Error accessing user data: {str(e)}")
-                    print(f"An error occurred: {str(e)}")
-            
-            # Check for performance report request
-            if user_input.lower() in ["how are you performing", "performance report", "self assessment"]:
-                try:
-                    from reflection import get_self_assessment_report
-                    report = get_self_assessment_report()
-                    print(f"TARS: {report}")
-                    if voice_enabled:
-                        speak(report)
-                    continue
-                except Exception as e:
-                    logging.error(f"Error generating performance report: {str(e)}")
-                    print(f"An error occurred: {str(e)}")
-            
-            # Log the user's message
-            logging.info(f"User: {user_input}")
-            
-            # Add to conversation history
-            conversation.append({"role": "user", "content": user_input})
-            
-            # Get user background if available - safely
-            background_info = None
-            if memory_system:
-                try:
-                    if hasattr(memory_system, 'get_user_background') and hasattr(memory_system, 'current_user'):
-                        user_id = memory_system.current_user
-                        background_info = memory_system.get_user_background(user_id)
-                        logging.info(f"Retrieved background for user: {user_id}")
-                except Exception as e:
-                    logging.error(f"Error getting user background: {str(e)}")
-            
-            # Get AI response
-            try:
-                response_data = get_ai_response(
-                    user_input, 
-                    conversation, 
-                    memory_manager=memory_system,
-                    rag_system=rag_system,
-                    voice_system=voice_system,
-                    adaptations=adaptations,
-                    background_info=background_info
-                )
-                
-                response = response_data["response"]
-                tool_used = response_data["tool_used"]
-                
-                # Add the AI's response to the conversation history
-                conversation.append({"role": "assistant", "content": response})
-                
-                # Log and store the interaction in memory
-                logging.info(f"TARS ({tool_used}): {response}")
-                
-                if memory_system:
-                    try:
-                        # Add the interaction to memory (different systems might use different methods)
-                        if hasattr(memory_system, 'add_message'):
-                            memory_system.add_message("user", user_input)
-                            memory_system.add_message("assistant", response)
-                        elif hasattr(memory_system, 'log_interaction'):
-                            user = getattr(memory_system, 'current_user', 'default_user')
-                            memory_system.log_interaction(user, user_input, response)
-                    except Exception as e:
-                        logging.error(f"Error processing message for memory: {str(e)}")
-            except Exception as e:
-                logging.error(f"Error getting AI response: {str(e)}")
-                response = f"I'm sorry, I encountered an error: {str(e)}"
-                print(f"TARS: {response}")
-                continue
-            
-            # Output the response
-            print(f"TARS: {response}")
-            
-            # Speak the response if voice is enabled
-            if voice_enabled:
-                try:
-                    speak(response)
-                except Exception as e:
-                    logging.error(f"Error speaking response: {str(e)}")
-                    print(f"[Voice error: {str(e)}]")
-        except KeyboardInterrupt:
-            print("\nInput interrupted.")
-            break
-        except Exception as e:
-            logging.error(f"Unexpected error: {str(e)}", exc_info=True)
-            print(f"\nAn error occurred: {str(e)}")
-            break
-    
-    # Save data before exiting
-    if memory_system:
-        memory_system.save_session()
-    if rag_system:
-        save_rag_index()
-    print("\nSession data saved. Goodbye!")
-    
-    return 0
-
-def extract_and_store_facts(text, user_id):
-    """
-    Extract potential facts from text and store them in the knowledge graph.
-    """
-    
-    # Look for preferences (I like/love/enjoy X)
-    preference_facts = re.findall(r"I (like|love|enjoy|prefer) (?:to )?([\w\s]+)", text, re.IGNORECASE)
-    for relation, preference in preference_facts:
-        preference = preference.strip().lower()
-        if len(preference) > 2:
-            try:
-                # Add user as entity if not exists
-                add_entity_to_graph(
-                    entity_id=f"user_{user_id}",
-                    entity_type="person",
-                    properties={"name": user_id},
-                    aliases=[user_id]
-                )
-                
-                # Add the preference as an entity
-                pref_id = f"pref_{preference.replace(' ', '_')}"
-                add_entity_to_graph(
-                    entity_id=pref_id,
-                    entity_type="preference",
-                    properties={"name": preference}
-                )
-                
-                # Connect them with the right relation
-                relation_map = {
-                    "like": "likes",
-                    "love": "loves", 
-                    "enjoy": "enjoys",
-                    "prefer": "prefers"
-                }
-                predicate = relation_map.get(relation.lower(), "likes")
-                
-                add_fact_to_graph(
-                    subject=f"user_{user_id}",
-                    predicate=predicate,
-                    object=pref_id,
-                    confidence=0.8,
-                    source="conversation"
-                )
-                
-                logger.info(f"Added preference: {user_id} {predicate} {preference}")
-            except Exception as e:
-                logger.error(f"Error adding preference to knowledge graph: {str(e)}")
-    
-    # Extract family information (siblings, parents, children, etc.)
-    family_patterns = [
-        # Siblings
-        (r"I have (\d+) (sibling|siblings)", "has_siblings", lambda x: int(x)),
-        (r"I have (\w+) (brother|brothers|sister|sisters)", "has_siblings", lambda x: {"brother": 1, "brothers": 2, "sister": 1, "sisters": 2}.get(x, 1)),
-        
-        # Children
-        (r"I have (\d+) (child|children|kid|kids)", "has_children", lambda x: int(x)),
-        (r"I have (\w+) (son|sons|daughter|daughters)", "has_children", lambda x: {"son": 1, "sons": 2, "daughter": 1, "daughters": 2}.get(x, 1)),
-        
-        # Parents
-        (r"My (mom|mother)(?:'s| is) (name is |called |)(\w+)", "has_mother", lambda x: x),
-        (r"My (dad|father)(?:'s| is) (name is |called |)(\w+)", "has_father", lambda x: x)
-    ]
-    
-    for pattern, relation, value_func in family_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            try:
-                # Add user as entity if not exists
-                add_entity_to_graph(
-                    entity_id=f"user_{user_id}",
-                    entity_type="person",
-                    properties={"name": user_id},
-                    aliases=[user_id]
-                )
-                
-                for match in matches:
-                    if len(match) >= 2:  # At least value and type
-                        value = match[0]
-                        relation_type = match[1].lower()
-                        
-                        # Process the value based on the relation type
-                        processed_value = value_func(value)
-                        
-                        # Store in memory system too for redundancy
-                        if memory_system:
-                            memory_system.store_user_info(user_id, relation, processed_value)
-                        
-                        # Add fact to graph
-                        fact_id = f"{relation}_{processed_value}".replace(" ", "_")
-                        add_entity_to_graph(
-                            entity_id=fact_id,
-                            entity_type="family_fact",
-                            properties={"value": processed_value, "type": relation_type}
-                        )
-                        
-                        add_fact_to_graph(
-                            subject=f"user_{user_id}",
-                            predicate=relation,
-                            object=fact_id,
-                            confidence=0.9,
-                            source="conversation"
-                        )
-                        
-                        logger.info(f"Added family info: {user_id} {relation} {processed_value}")
-            except Exception as e:
-                logger.error(f"Error adding family info to knowledge graph: {str(e)}")
-    
-    # Extract age information
-    age_patterns = [
-        r"I am (\d+) years old",
-        r"I'm (\d+) years old",
-        r"I'm (\d+)",
-        r"My age is (\d+)"
-    ]
-    
-    for pattern in age_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            try:
-                age = int(matches[0])
-                
-                # Store in memory system
-                if memory_system:
-                    memory_system.store_user_info(user_id, "age", age)
-                
-                # Add to knowledge graph
-                add_entity_to_graph(
-                    entity_id=f"user_{user_id}",
-                    entity_type="person",
-                    properties={"age": age}
-                )
-                
-                logger.info(f"Added age info: {user_id} is {age} years old")
-            except Exception as e:
-                logger.error(f"Error adding age info: {str(e)}")
-    
-    # Extract location information
-    location_patterns = [
-        r"I (?:live|stay|reside) in ([\w\s,]+)",
-        r"I'm from ([\w\s,]+)",
-        r"I am from ([\w\s,]+)"
-    ]
-    
-    for pattern in location_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            try:
-                location = matches[0].strip()
-                
-                # Store in memory system
-                if memory_system:
-                    memory_system.store_user_info(user_id, "location", location)
-                
-                # Add to knowledge graph
-                location_id = f"location_{location.replace(' ', '_')}"
-                add_entity_to_graph(
-                    entity_id=location_id,
-                    entity_type="location",
-                    properties={"name": location}
-                )
-                
-                add_fact_to_graph(
-                    subject=f"user_{user_id}",
-                    predicate="lives_in",
-                    object=location_id,
-                    confidence=0.9,
-                    source="conversation"
-                )
-                
-                logger.info(f"Added location info: {user_id} lives in {location}")
-            except Exception as e:
-                logger.error(f"Error adding location info: {str(e)}")
-                
-    # Store the entire message in memory for later context
-    if memory_system:
-        existing_messages = memory_system.get_user_background(user_id).get("important_messages", [])
-        if len(existing_messages) > 10:
-            existing_messages = existing_messages[-10:]  # Keep last 10 messages
-        existing_messages.append(text)
-        memory_system.store_user_info(user_id, "important_messages", existing_messages)
+# Import the continuous learning system
+from continuous_learning import get_learning_system
 
 def get_ai_response(query, conversation, memory_manager=None, rag_system=None, voice_system=None, adaptations=None, background_info=None):
     """
@@ -1828,66 +1449,102 @@ def get_ai_response(query, conversation, memory_manager=None, rag_system=None, v
         from tools import ToolRegistry
         tools_registry = ToolRegistry()
         
+        # Get learning system for continuous improvement
+        learning_system = get_learning_system()
+        
+        # Initialize variables
+        learning_context = None
+        user_related_context = None
+        
         # Check if any tool can handle this query
         tool_response = None
         tool_used = "Standard AI"
         
+        # Get learning insights to improve response
+        learning_insights = learning_system.get_learning_insights(query)
+        logger.info(f"Got learning insights with {len(learning_insights.get('similar_successful_interactions', []))} similar interactions")
+        
+        # Check if learning system suggests a specific tool based on successful past interactions
+        suggested_tools = learning_insights.get("suggested_tools", [])
+        if suggested_tools:
+            for suggested_tool_name in suggested_tools:
+                for tool in tools_registry.tools:
+                    if tool.name == suggested_tool_name and tool.can_handle(query):
+                        logger.info(f"Using tool {suggested_tool_name} suggested by learning system")
+                        result = tool.execute(query)
+                        if result.get("success", False):
+                            tool_response = result.get("response")
+                            tool_used = suggested_tool_name
+                            break
+                if tool_response:
+                    break
+        
         # Check if this is a factual query about current events that should use web search
-        leadership_terms = ["president", "vice president", "prime minister", "chancellor", "ceo", "pope"]
-        is_leadership_query = any(term in query.lower() for term in leadership_terms)
-        
-        # For factual queries about current events, try web search first
-        if is_factual_question(query) and (is_leadership_query or should_search_web(query)):
-            try:
-                logger.info("Attempting web search for factual question about current events")
+        if not tool_response:
+            leadership_terms = ["president", "vice president", "prime minister", "chancellor", "ceo", "pope"]
+            is_leadership_query = any(term in query.lower() for term in leadership_terms)
+            
+            # For factual queries about current events, try web search first
+            if is_factual_question(query) and (is_leadership_query or should_search_web(query)):
                 try:
-                    # Try to import web_search module
-                    from web_search import search_web
-                    logger.info(f"Web search module imported successfully, API key present: {bool(os.getenv('GOOGLE_API_KEY'))}")
-                    logger.info(f"CSE ID present: {bool(os.getenv('GOOGLE_CSE_ID'))}")
-                    
-                    # Log query information
-                    logger.info(f"Performing priority web search with query: '{query}'")
-                    web_results = search_web(query)
-                    logger.info(f"Web search completed: Got {len(web_results)} results")
-                    
-                    if web_results and len(web_results) > 0:
-                        logger.info("Web search returned results")
-                        web_context = "\n".join([f"- {result}" for result in web_results[:3]])
-                        logger.info(f"Web context created with {len(web_context)} characters")
+                    logger.info("Attempting web search for factual question about current events")
+                    try:
+                        # Try to import web_search module
+                        from web_search import search_web
+                        logger.info(f"Web search module imported successfully, API key present: {bool(os.getenv('GOOGLE_API_KEY'))}")
+                        logger.info(f"CSE ID present: {bool(os.getenv('GOOGLE_CSE_ID'))}")
                         
-                        # Prepare messages with web context
-                        messages = prepare_messages_with_context(
-                            query=query, 
-                            conversation=conversation,
-                            web_context=web_context,
-                            background_info=background_info,
-                            adaptations=adaptations
-                        )
+                        # Log query information
+                        logger.info(f"Performing priority web search with query: '{query}'")
+                        web_results = search_web(query)
+                        logger.info(f"Web search completed: Got {len(web_results)} results")
                         
-                        # Get response from OpenAI API
-                        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-                        response = client.chat.completions.create(
-                            model="gpt-4",
-                            messages=messages,
-                            temperature=0.7,
-                            max_tokens=300
-                        )
-                        tool_response = response.choices[0].message.content.strip()
-                        tool_used = "Web Search"
-                        
-                        # Return early since we've found our answer
-                        return {
-                            "response": tool_response,
-                            "tool_used": tool_used
-                        }
-                except ImportError as e:
-                    logger.error(f"Web search module import error: {str(e)}")
+                        if web_results and len(web_results) > 0:
+                            logger.info("Web search returned results")
+                            web_context = "\n".join([f"- {result}" for result in web_results[:3]])
+                            logger.info(f"Web context created with {len(web_context)} characters")
+                            
+                            # Prepare messages with web context
+                            messages = prepare_messages_with_context(
+                                query=query, 
+                                conversation=conversation,
+                                web_context=web_context,
+                                background_info=background_info,
+                                adaptations=adaptations
+                            )
+                            
+                            # Get response from OpenAI API
+                            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                            response = client.chat.completions.create(
+                                model="gpt-4",
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=300
+                            )
+                            tool_response = response.choices[0].message.content.strip()
+                            tool_used = "Web Search"
+                            
+                            # Record this interaction for continuous learning
+                            interaction_id = learning_system.record_interaction(
+                                query=query,
+                                response=tool_response,
+                                tools_used={"web_search": True, "num_results": len(web_results)},
+                            )
+                            logger.info(f"Recorded web search interaction with ID: {interaction_id}")
+                            
+                            # Return early since we've found our answer
+                            return {
+                                "response": tool_response,
+                                "tool_used": tool_used,
+                                "interaction_id": interaction_id
+                            }
+                    except ImportError as e:
+                        logger.error(f"Web search module import error: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Error in web search module: {str(e)}", exc_info=True)
                 except Exception as e:
-                    logger.error(f"Error in web search module: {str(e)}", exc_info=True)
-            except Exception as e:
-                logger.error(f"Error with priority web search: {str(e)}")
-        
+                    logger.error(f"Error with priority web search: {str(e)}")
+            
         # First, check if the query is about the user or needs personalization from knowledge graph
         user_related_context = None
         if memory_manager and hasattr(memory_manager, 'current_user'):
@@ -2037,13 +1694,31 @@ def get_ai_response(query, conversation, memory_manager=None, rag_system=None, v
         if tool_response is None:
             logger.info("Using standard AI response")
             
+            # Add learning insights to the system prompt if available
+            learning_context = None
+            if learning_insights and learning_insights.get("similar_successful_interactions"):
+                # Include examples of successful responses to similar queries
+                successful_examples = learning_insights.get("similar_successful_interactions", [])
+                if successful_examples:
+                    learning_context = "Examples of successful responses to similar queries:\n"
+                    for i, example in enumerate(successful_examples[:2], 1):
+                        learning_context += f"{i}. Query: {example['query']}\n   Response: {example['response']}\n\n"
+                    
+                    # Add any improvement suggestions
+                    suggestions = learning_insights.get("improvement_suggestions", [])
+                    if suggestions:
+                        learning_context += "Suggestions based on past successful interactions:\n"
+                        for suggestion in suggestions:
+                            learning_context += f"- {suggestion}\n"
+            
             # Prepare messages with context
             messages = prepare_messages_with_context(
                 query=query, 
                 conversation=conversation,
                 background_info=background_info,
                 adaptations=adaptations,
-                user_context=user_related_context
+                user_context=user_related_context,
+                learning_context=learning_context
             )
             
             # Get response from OpenAI API - Update to new format
@@ -2061,9 +1736,21 @@ def get_ai_response(query, conversation, memory_manager=None, rag_system=None, v
                 tool_used = "Knowledge Graph"
         
         # Return response with tool information
+        interaction_id = learning_system.record_interaction(
+            query=query,
+            response=tool_response,
+            tools_used={
+                "user_related_context_used": bool(user_related_context),
+                "learning_insights_used": bool(learning_context)
+            }
+        )
+        logger.info(f"Recorded interaction with ID: {interaction_id}")
+        
+        # Return response with tool information
         return {
             "response": tool_response,
-            "tool_used": tool_used
+            "tool_used": tool_used,
+            "interaction_id": interaction_id
         }
         
     except Exception as e:
@@ -2073,7 +1760,7 @@ def get_ai_response(query, conversation, memory_manager=None, rag_system=None, v
             "tool_used": "Error"
         }
 
-def prepare_messages_with_context(query, conversation, web_context=None, background_info=None, adaptations=None, user_context=None):
+def prepare_messages_with_context(query, conversation, web_context=None, background_info=None, adaptations=None, user_context=None, learning_context=None):
     """
     Prepare messages for the API call with appropriate context.
     
@@ -2084,12 +1771,13 @@ def prepare_messages_with_context(query, conversation, web_context=None, backgro
         background_info (dict, optional): User background information
         adaptations (dict, optional): Response adaptations from meta learning
         user_context (str, optional): User-specific context from knowledge graph
+        learning_context (str, optional): Context from continuous learning system
         
     Returns:
         list: Formatted messages for the API call
     """
     # Start with base system prompt
-    system_prompt = """You are TARS, a helpful AI assistant modeled after the TARS robot from the movie Interstellar. 
+    system_prompt = """You are TARS, a helpful AI assistant created by Charles Williams and modeled after the TARS robot from the movie Interstellar. 
 You have a default humor setting of 75% and aim to be friendly, helpful, and occasionally witty like your movie counterpart.
 Keep your answers brief and to the point while being friendly and helpful.
 
@@ -2152,6 +1840,13 @@ Today's date is """ + datetime.now().strftime("%B %d, %Y") + "."
             "content": f"Relevant information from the web:\n{web_context}\n\nIncorporate this information directly in your response without mentioning or citing sources."
         })
     
+    # Add learning context if available
+    if learning_context:
+        messages.append({
+            "role": "system",
+            "content": f"Additional guidance based on learning from past interactions:\n{learning_context}\n\nIncorporate these insights to improve your response quality."
+        })
+    
     # Add conversation history (limited to last 10 messages)
     if conversation:
         # Make a copy to avoid modifying the original
@@ -2186,14 +1881,57 @@ def is_factual_question(query):
     if os.getenv("DISABLE_WEB_SEARCH", "").lower() in ["true", "1", "yes"]:
         return False
     
+    # Skip personal questions about the user's preferences or information
+    personal_query_indicators = [
+        "do i like", "my favorite", "my preference", "about me", 
+        "do you know", "do you remember", "what do i", "where do i",
+        "my family", "my job", "my work", "my hobbies", "i go to",
+        "my school", "school", "university", "college", "where i", "i attend",
+        "am i", "was i", "did i", "have i", "should i", "can i", "could i",
+        "will i", "would i", "what did i", "what is my", "what's my", "where is my",
+        "my height", "my weight", "my age", "how tall am i", "how old am i"
+    ]
+    
+    query_lower = query.lower()
+    if any(indicator in query_lower for indicator in personal_query_indicators):
+        return False
+        
+    # Check if the query is seeking personal advice or opinion
+    personal_advice_patterns = [
+        r"^should i",
+        r"^would i",
+        r"^could i",
+        r"^can i",
+        r"^do i need",
+        r"^(what|which|how) should i",
+        r"^is it (good|bad|worth|advisable) for me to",
+    ]
+    
+    for pattern in personal_advice_patterns:
+        if re.search(pattern, query_lower):
+            return False
+    
     # Special case: Questions about current world leaders and major offices always use web search
     leadership_terms = ["president", "vice president", "prime minister", "chancellor", "ceo", "pope"]
-    if any(term in query.lower() for term in leadership_terms):
+    if any(term in query_lower for term in leadership_terms):
         return True
         
     # Skip web search for personal questions about TARS or the system
-    if any(term in query.lower() for term in ["your name", "tars", "assistant"]):
+    if any(term in query_lower for term in ["your name", "tars", "assistant"]):
         return False
+    
+    # Check for geographic questions about locations (special case)
+    geographic_patterns = [
+        r"where is (?!my\b)(?!your\b)(.+)",
+        r"location of (?!my\b)(?!your\b)(.+)",
+        r"how (far|close) is (.+) (from|to) (.+)",
+        r"directions (to|from) (.+)",
+        r"which (country|state|city|province|continent) (.+)"
+    ]
+    
+    for pattern in geographic_patterns:
+        if re.search(pattern, query_lower):
+            return True
         
     # Check for question words and common factual question patterns
     factual_indicators = [
@@ -2203,11 +1941,12 @@ def is_factual_question(query):
         r"facts (on|about)",
         r"(latest|recent|current) (news|events|information) (on|about|regarding)",
         r"history of",
+        r"explain (.+) to me",
     ]
     
     # Check if the query matches any of the patterns
     for pattern in factual_indicators:
-        if re.search(pattern, query.lower()):
+        if re.search(pattern, query_lower):
             return True
     
     return False
@@ -2215,14 +1954,43 @@ def is_factual_question(query):
 def should_search_web(query):
     """Determine if a query should trigger a web search"""
     # Skip web search for voice commands
-    if query.lower().startswith("voice "):
+    query_lower = query.lower()
+    if query_lower.startswith("voice "):
         return False
+        
+    # Skip personal questions and advice
+    personal_advice_patterns = [
+        r"^should i",
+        r"^would i",
+        r"^could i",
+        r"^can i",
+        r"^do i need",
+        r"^(what|which|how) should i",
+        r"^is it (good|bad|worth|advisable) for me to",
+    ]
+    
+    for pattern in personal_advice_patterns:
+        if re.search(pattern, query_lower):
+            return False
+    
+    # Check for geographic questions about locations (special case)
+    geographic_patterns = [
+        r"where is (?!my\b)(?!your\b)(.+)",
+        r"location of (?!my\b)(?!your\b)(.+)",
+        r"how (far|close) is (.+) (from|to) (.+)",
+        r"directions (to|from) (.+)",
+        r"which (country|state|city|province|continent) (.+)"
+    ]
+    
+    for pattern in geographic_patterns:
+        if re.search(pattern, query_lower):
+            return True
     
     # Always check web for queries about current leadership positions
     leadership_terms = ["president", "vice president", "prime minister", "chancellor", "ceo", 
                        "pope", "secretary", "head of state", "governor", "senator", "congress"]
     
-    if any(term in query.lower() for term in leadership_terms):
+    if any(term in query_lower for term in leadership_terms):
         return True
         
     # Always check web for queries about recent deaths, events, or current position holders
@@ -2234,7 +2002,7 @@ def should_search_web(query):
     ]
     
     for pattern in death_patterns:
-        if re.search(pattern, query.lower()):
+        if re.search(pattern, query_lower):
             return True
     
     # Check for terms that suggest need for current information
@@ -2253,12 +2021,12 @@ def should_search_web(query):
                 
     # Check for entity names in the query
     for entity in entities:
-        if entity in query.lower():
+        if entity in query_lower:
             return True
     
     # Check for current info terms in the query
     for term in current_info_terms:
-        if term in query.lower():
+        if term in query_lower:
             return True
     
     # Check for date-related queries indicating time sensitivity
@@ -2431,22 +2199,15 @@ def is_news_relevant(query, result):
     return relevance
 
 def update_user_satisfaction(satisfaction_score=None, conversation_id=None):
-    """
-    Update user satisfaction metrics based on explicit feedback.
-    
-    Args:
-        satisfaction_score: A float between 0 and 1 representing user satisfaction
-        conversation_id: Optional identifier for the conversation
-    """
+    """Record user satisfaction with the assistant"""
     if satisfaction_score is not None:
+        # Validate score
         try:
-            logger = logging.getLogger('tars.metrics')
-            logger.info(f"Recording user satisfaction score: {satisfaction_score}")
-            
-            # Clamp the score to ensure it's within valid range
-            valid_score = max(0.0, min(1.0, float(satisfaction_score)))
-            
-            # Record the satisfaction score in our reflection system
+            valid_score = float(satisfaction_score)
+            if valid_score < 0 or valid_score > 1:
+                return False
+                
+            # Record the score
             record_performance_metrics(
                 user_satisfaction=valid_score
             )
@@ -2456,6 +2217,280 @@ def update_user_satisfaction(satisfaction_score=None, conversation_id=None):
             logger.error(f"Error recording user satisfaction: {str(e)}")
             return False
     return False
+
+def chat_with_ai(memory_system=None, rag_system=None, voice_system=None, adaptations=None):
+    """Chat with the AI assistant in a loop"""
+    global exit_flag, voice_enabled
+    
+    exit_flag = False
+    print("\n--------------------------------------------------")
+    print("TARS is ready! Type your message.")
+    print("Say 'exit' or 'quit' to end the conversation.")
+    print("Voice commands: 'voice off', 'voice on', 'voice list', 'voice [style]'")
+    print("Google Search: 'set google api key [YOUR_KEY]', 'set google cse id [YOUR_ID]'")
+    print("\nPress Enter with no text to start recording, press Enter again to stop and process.")
+    print("Press Enter at any time to interrupt TARS and start recording your next question.")
+    print("----------------------------------------")
+    
+    # Debug check of knowledge graph
+    debug_check_knowledge_graph()
+    
+    # Populate knowledge graph if empty
+    populate_knowledge_graph_if_empty()
+    
+    # Initialize continuous learning system
+    learning_system = get_learning_system()
+    
+    # Initialize conversation with history from previous session
+    conversation = []
+    if memory_system and hasattr(memory_system, 'load_conversation_history'):
+        try:
+            previous_conversation = memory_system.load_conversation_history()
+            if previous_conversation:
+                conversation = previous_conversation
+                print(f"Loaded {len(previous_conversation)} messages from previous conversation")
+        except Exception as e:
+            logging.error(f"Error loading conversation history: {str(e)}")
+    
+    # Set a default user for memory system
+    if memory_system:
+        try:
+            if hasattr(memory_system, 'current_user'):
+                # Use default or already set user
+                if memory_system.current_user == "default_user":
+                    memory_system.current_user = "Charles"
+                    logging.info(f"Using default user: {memory_system.current_user}")
+            logging.info("Memory system initialized with user")
+        except Exception as e:
+            logging.error(f"Error setting up memory system user: {str(e)}")
+    
+    # Keep track of the last interaction for feedback
+    last_interaction_id = None
+            
+    while not exit_flag:
+        try:
+            # Get user input
+            user_input = get_user_input(voice_system)
+            
+            # If the program was interrupted, we might get None
+            if user_input is None:
+                continue
+                
+            # Check for exit command
+            if user_input.lower() in ["exit", "quit"]:
+                print("Goodbye!")
+                break
+                
+            # Check for voice commands
+            if user_input.lower().startswith("voice "):
+                command = user_input[6:].strip()
+                response = handle_voice_command(command)
+                print(f"TARS: {response}")
+                continue
+                
+            # Check for Google API key command
+            if user_input.lower().startswith("set google api key "):
+                api_key = user_input[18:].strip()
+                os.environ["GOOGLE_API_KEY"] = api_key
+                print(f"TARS: Google API key set. Length: {len(api_key)} characters")
+                continue
+                
+            # Check for Google CSE ID command
+            if user_input.lower().startswith("set google cse id "):
+                cse_id = user_input[17:].strip()
+                os.environ["GOOGLE_CSE_ID"] = cse_id
+                print(f"TARS: Google Custom Search Engine ID set. Value: {cse_id}")
+                continue
+        
+            # Record implicit feedback for the previous interaction if this is a follow-up
+            if last_interaction_id and user_input:
+                learning_system.record_implicit_feedback(last_interaction_id, user_input)
+                logging.info(f"Recorded implicit feedback for interaction {last_interaction_id}")
+                
+            # Check for feedback commands to record explicit feedback
+            feedback_commands = {
+                "that was good": 1.0,
+                "good answer": 1.0,
+                "perfect": 1.0,
+                "thank you": 0.9,
+                "thanks": 0.9,
+                "helpful": 0.8,
+                "that's better": 0.8,
+                "that was bad": 0.2,
+                "wrong answer": 0.1,
+                "incorrect": 0.1,
+                "not helpful": 0.3
+            }
+            
+            user_input_lower = user_input.lower()
+            feedback_recorded = False
+            for command, score in feedback_commands.items():
+                if command in user_input_lower and last_interaction_id:
+                    learning_system.record_explicit_feedback(last_interaction_id, score, user_input)
+                    print(f"Feedback recorded for previous response (score: {score})")
+                    feedback_recorded = True
+                    break
+            
+            if feedback_recorded:
+                continue
+        
+            # Handle memory-related commands
+            if user_input.lower() == "what do you know about me" and memory_system:
+                try:
+                    # Get user background safely - don't assume current_user attribute
+                    user_id = getattr(memory_system, 'current_user', 'default_user')
+                    
+                    # See if we can get user background
+                    if hasattr(memory_system, 'get_user_background'):
+                        background = memory_system.get_user_background(user_id)
+                        if background:
+                            formatted_info = "\n".join([f"{k}: {v}" for k, v in background.items() 
+                                                      if k != "important_messages" and v])
+                            response = f"Here's what I know about you:\n{formatted_info}"
+                        else:
+                            response = "I don't have much information about you yet."
+                    else:
+                        response = "I don't have access to user background information."
+                    
+                    # Add the interaction to memory (different systems might use different methods)
+                    if hasattr(memory_system, 'add_message'):
+                        memory_system.add_message("user", user_input)
+                        memory_system.add_message("assistant", response)
+                    elif hasattr(memory_system, 'log_interaction'):
+                        user = getattr(memory_system, 'current_user', 'default_user')
+                        memory_system.log_interaction(user, user_input, response)
+                        
+                    print(f"TARS: {response}")
+                    if voice_enabled:
+                        speak(response)
+                    continue
+                except Exception as e:
+                    logging.error(f"Error accessing user data: {str(e)}")
+                    print(f"An error occurred: {str(e)}")
+            
+            # Check for learning report request
+            if user_input.lower() in ["learning report", "what have you learned", "show learning stats"]:
+                try:
+                    report = learning_system.generate_learning_report()
+                    
+                    # Format the report for display
+                    formatted_report = "Learning System Report:\n"
+                    formatted_report += f"Total interactions: {report['stats']['total_interactions']}\n"
+                    formatted_report += f"Successful interactions: {report['stats']['successful_interactions']}\n"
+                    formatted_report += f"Feedback received: {report['stats']['feedback_received']}\n"
+                    
+                    if 'topic_expertise' in report and report['topic_expertise']:
+                        formatted_report += "\nTopic expertise:\n"
+                        for topic, data in report['topic_expertise'].items():
+                            formatted_report += f"- {topic}: {data['score']:.2f} (from {data['count']} interactions)\n"
+                    
+                    if 'best_topics' in report and report['best_topics']:
+                        formatted_report += f"\nBest topics: {', '.join(report['best_topics'])}\n"
+                    
+                    if 'improvement_areas' in report and report['improvement_areas']:
+                        formatted_report += f"\nAreas for improvement: {', '.join(report['improvement_areas'])}\n"
+                    
+                    if 'common_patterns' in report and report['common_patterns']:
+                        formatted_report += "\nPatterns observed:\n"
+                        for pattern in report['common_patterns']:
+                            formatted_report += f"- {pattern}\n"
+                    
+                    print(f"TARS: {formatted_report}")
+                    if voice_enabled:
+                        speak(formatted_report)
+                    continue
+                except Exception as e:
+                    logging.error(f"Error generating learning report: {str(e)}")
+                    print(f"An error occurred while generating the learning report: {str(e)}")
+                    continue
+            
+            # Check for performance report request
+            if user_input.lower() in ["how are you performing", "performance report", "self assessment"]:
+                try:
+                    from reflection import get_self_assessment_report
+                    report = get_self_assessment_report()
+                    print(f"TARS: {report}")
+                    if voice_enabled:
+                        speak(report)
+                    continue
+                except Exception as e:
+                    logging.error(f"Error generating performance report: {str(e)}")
+                    print(f"Unable to generate performance report: {str(e)}")
+                    continue
+                    
+            # If we've reached here, process as a regular query
+            try:
+                # Add to memory if available
+                if memory_system and hasattr(memory_system, 'add_message'):
+                    memory_system.add_message("user", user_input)
+                
+                # Get user background for personalization
+                background_info = None
+                if memory_system and hasattr(memory_system, 'get_user_background'):
+                    try:
+                        user_id = getattr(memory_system, 'current_user', 'default_user')
+                        background_info = memory_system.get_user_background(user_id)
+                    except Exception as e:
+                        logging.error(f"Error getting user background: {str(e)}")
+                
+                # Get AI response
+                result = get_ai_response(
+                    user_input, 
+                    conversation=conversation, 
+                    memory_manager=memory_system,
+                    rag_system=rag_system,
+                    voice_system=voice_system,
+                    adaptations=adaptations,
+                    background_info=background_info
+                )
+                
+                # Extract response and metadata
+                response = result.get("response", "I'm sorry, I couldn't generate a response.")
+                tool_used = result.get("tool_used", "Standard AI")
+                interaction_id = result.get("interaction_id")
+                
+                # Store the interaction ID for potential feedback
+                last_interaction_id = interaction_id
+                
+                # Add to conversation history (in-memory)
+                conversation.append({"role": "user", "content": user_input})
+                conversation.append({"role": "assistant", "content": response})
+                
+                # Trim conversation if it gets too long
+                if len(conversation) > 20:  # Keep last 20 messages
+                    conversation = conversation[-20:]
+                
+                # Add to memory if available
+                if memory_system and hasattr(memory_system, 'add_message'):
+                    memory_system.add_message("assistant", response)
+                elif memory_system and hasattr(memory_system, 'log_interaction'):
+                    user_id = getattr(memory_system, 'current_user', 'default_user')
+                    memory_system.log_interaction(user_id, user_input, response)
+                
+                # Display response
+                print(f"TARS ({tool_used}): {response}")
+                
+                # Speak response if voice is enabled
+                if voice_enabled:
+                    speak(response)
+                    
+            except KeyboardInterrupt:
+                # Allow interruption during response
+                print("\nInterrupted.")
+                
+            except Exception as e:
+                error_message = f"I encountered an error while processing your request: {str(e)}"
+                print(f"TARS: {error_message}")
+                logging.error(f"Error processing query: {str(e)}", exc_info=True)
+                if voice_enabled:
+                    speak(error_message)
+                    
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+        except Exception as e:
+            error_message = f"An unexpected error occurred: {str(e)}"
+            print(f"Error: {error_message}")
+            logging.error(f"Unexpected error: {str(e)}", exc_info=True)
 
 def main():
     """Main function to run the TARS AI assistant"""
@@ -2638,3 +2673,24 @@ def handle_voice_command(style_name):
     except Exception as e:
         logging.error(f"Error handling voice command: {str(e)}")
         print("Error changing voice style.")
+
+def extract_and_store_facts(text, user_id):
+    """
+    Extracts and stores facts about the user from conversation.
+    This is a simplified placeholder function.
+    """
+    try:
+        # Import on-demand to avoid circular dependencies
+        from knowledge_db import KnowledgeDatabase
+        
+        # Create a database instance
+        db = KnowledgeDatabase()
+        
+        # Extract facts using the database's built-in function
+        if hasattr(db, 'extract_and_store_facts'):
+            db.extract_and_store_facts(user_id, text, "", None)
+            
+    except Exception as e:
+        logger = logging.getLogger("tars.knowledge")
+        logger.error(f"Error extracting facts: {str(e)}")
+        # Silently fail - this is a background enhancement

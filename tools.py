@@ -273,9 +273,9 @@ class CalculatorTool(Tool):
 class NewsTool(Tool):
     """Tool for retrieving news information"""
     
-    def __init__(self):
+    def __init__(self, api_key=None):
         super().__init__("News Tool", "Get the latest news information")
-        self.api_key = os.getenv("NEWS_API_KEY")
+        self.api_key = api_key or os.getenv("NEWS_API_KEY")
         self.base_url = "https://newsapi.org/v2"
     
     def can_handle(self, query: str) -> bool:
@@ -567,6 +567,307 @@ class NewsTool(Tool):
             }
 
 
+class FinanceTool(Tool):
+    """Finance tool for getting stock and cryptocurrency information"""
+    
+    def __init__(self):
+        super().__init__(
+            name="Finance Tool",
+            description="Get stock prices, cryptocurrency information, and other financial data"
+        )
+        self.crypto_base_url = "https://api.coingecko.com/api/v3"
+        self.stock_base_url = "https://query1.finance.yahoo.com/v8/finance/chart"
+    
+    def can_handle(self, query: str) -> bool:
+        """Check if query is asking about finance, stocks, or crypto"""
+        query = query.lower()
+        finance_keywords = [
+            "stock", "stocks", "share", "shares", "price", "market", 
+            "crypto", "cryptocurrency", "bitcoin", "ethereum", "coin", 
+            "ticker", "symbol", "invest", "investment", "etf", "fund",
+            "nasdaq", "dow", "s&p", "nyse", "portfolio", "dividend",
+            "financial", "finance", "trade", "trading", "exchange"
+        ]
+        
+        # Check for specific company or crypto mentions
+        common_companies = ["apple", "microsoft", "amazon", "google", "facebook", "tesla", "nvidia"]
+        common_cryptos = ["btc", "eth", "bitcoin", "ethereum", "dogecoin", "cardano", "solana", "xrp"]
+        
+        if any(keyword in query for keyword in finance_keywords):
+            return True
+        
+        if any(company in query for company in common_companies) and "price" in query:
+            return True
+            
+        if any(crypto in query for crypto in common_cryptos):
+            return True
+        
+        return False
+    
+    def extract_asset(self, query: str) -> Tuple[str, str]:
+        """
+        Extract asset type and ticker/name from query
+        
+        Returns:
+            Tuple[str, str]: (asset_type, ticker)
+            asset_type can be 'stock' or 'crypto'
+        """
+        query = query.lower()
+        
+        # Map of common names to tickers
+        stock_mapping = {
+            "apple": "AAPL",
+            "microsoft": "MSFT",
+            "amazon": "AMZN",
+            "google": "GOOGL",
+            "alphabet": "GOOGL",
+            "facebook": "META",
+            "meta": "META",
+            "tesla": "TSLA",
+            "nvidia": "NVDA",
+            "netflix": "NFLX",
+            "disney": "DIS",
+            "coca cola": "KO",
+            "coke": "KO",
+            "pepsi": "PEP",
+            "walmart": "WMT",
+            "target": "TGT",
+            "nike": "NKE",
+            "mcdonalds": "MCD",
+            "starbucks": "SBUX",
+            "goldman sachs": "GS",
+            "jpmorgan": "JPM",
+            "jp morgan": "JPM",
+            "bank of america": "BAC",
+            "at&t": "T",
+            "verizon": "VZ",
+            "exxon": "XOM",
+            "chevron": "CVX",
+            "johnson & johnson": "JNJ",
+            "pfizer": "PFE",
+            "moderna": "MRNA"
+        }
+        
+        crypto_mapping = {
+            "bitcoin": "bitcoin",
+            "btc": "bitcoin",
+            "ethereum": "ethereum",
+            "eth": "ethereum",
+            "dogecoin": "dogecoin",
+            "doge": "dogecoin",
+            "cardano": "cardano",
+            "ada": "cardano",
+            "solana": "solana",
+            "sol": "solana",
+            "ripple": "ripple",
+            "xrp": "ripple",
+            "binance coin": "binancecoin",
+            "bnb": "binancecoin",
+            "polkadot": "polkadot",
+            "dot": "polkadot",
+            "litecoin": "litecoin",
+            "ltc": "litecoin"
+        }
+        
+        # Check for stock ticker pattern (all caps, 1-5 letters)
+        ticker_match = re.search(r'\b([A-Z]{1,5})\b', query)
+        if ticker_match:
+            return "stock", ticker_match.group(1)
+        
+        # Look for company names in the query
+        for company, ticker in stock_mapping.items():
+            if company in query:
+                return "stock", ticker
+        
+        # Look for crypto names in the query
+        for crypto_name, coin_id in crypto_mapping.items():
+            if crypto_name in query:
+                return "crypto", coin_id
+        
+        # Check for general categories
+        if any(word in query for word in ["crypto", "cryptocurrency", "bitcoin", "ethereum"]):
+            return "crypto", "bitcoin"  # Default to bitcoin if generic crypto query
+        
+        # Default to stock and try to find any capitalized words that might be tickers
+        capitalized_words = re.findall(r'\b([A-Z][a-zA-Z]*)\b', query)
+        if capitalized_words:
+            return "stock", capitalized_words[0]
+            
+        return "stock", "SPY"  # Default to S&P 500 ETF if nothing specific found
+    
+    def get_stock_price(self, ticker: str) -> Dict[str, Any]:
+        """Get stock price data"""
+        try:
+            url = f"{self.stock_base_url}/{ticker}"
+            params = {
+                "interval": "1d",
+                "range": "1d"
+            }
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            
+            response = requests.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract the relevant data
+            chart_data = data.get("chart", {}).get("result", [{}])[0]
+            meta = chart_data.get("meta", {})
+            
+            company_name = meta.get("shortName", ticker)
+            current_price = meta.get("regularMarketPrice", None)
+            previous_close = meta.get("previousClose", None)
+            currency = meta.get("currency", "USD")
+            
+            if current_price is None:
+                return {"success": False, "error": "Could not retrieve price data"}
+            
+            # Calculate change
+            change = 0
+            percent_change = 0
+            if previous_close:
+                change = current_price - previous_close
+                percent_change = (change / previous_close) * 100
+            
+            return {
+                "success": True,
+                "name": company_name,
+                "ticker": ticker,
+                "price": current_price,
+                "change": change,
+                "percent_change": percent_change,
+                "currency": currency
+            }
+        
+        except Exception as e:
+            logging.error(f"Error getting stock price for {ticker}: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    def get_crypto_price(self, coin_id: str) -> Dict[str, Any]:
+        """Get cryptocurrency price data"""
+        try:
+            # Handle common formats that might be passed
+            if coin_id == "BTC-USD" or coin_id == "BTC":
+                coin_id = "bitcoin"
+            elif coin_id == "ETH-USD" or coin_id == "ETH":
+                coin_id = "ethereum"
+            # Strip any suffixes like -USD that might be present
+            coin_id = coin_id.split('-')[0].lower()
+            
+            url = f"{self.crypto_base_url}/coins/{coin_id}"
+            params = {
+                "localization": "false",
+                "tickers": "false",
+                "market_data": "true",
+                "community_data": "false",
+                "developer_data": "false"
+            }
+            
+            logging.info(f"Fetching crypto price for {coin_id} from {url}")
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            current_price = data.get("market_data", {}).get("current_price", {}).get("usd", None)
+            if current_price is None:
+                return {"success": False, "error": "Could not retrieve price data"}
+            
+            # Get additional market data
+            market_cap = data.get("market_data", {}).get("market_cap", {}).get("usd", None)
+            price_change_24h = data.get("market_data", {}).get("price_change_percentage_24h", None)
+            
+            # Format the price properly
+            formatted_price = float(current_price)
+            
+            return {
+                "success": True,
+                "name": data.get("name", coin_id),
+                "symbol": data.get("symbol", "").upper(),
+                "price": formatted_price,
+                "change_24h_percent": price_change_24h,
+                "market_cap": market_cap
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting crypto price for {coin_id}: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    def execute(self, query: str, **kwargs) -> Dict[str, Any]:
+        """Get financial information based on the query"""
+        try:
+            asset_type, asset_id = self.extract_asset(query)
+            
+            if asset_type == "stock":
+                data = self.get_stock_price(asset_id)
+                
+                if not data["success"]:
+                    return {
+                        "response": f"Sorry, I couldn't get information for the stock {asset_id}: {data.get('error', 'Unknown error')}",
+                        "source": "Finance Tool",
+                        "success": False
+                    }
+                
+                # Format positive or negative change with appropriate sign
+                change_sign = "+" if data["change"] >= 0 else ""
+                percent_sign = "+" if data["percent_change"] >= 0 else ""
+                
+                result = (
+                    f"{data['name']} ({data['ticker']}): ${data['price']:.2f} "
+                    f"{change_sign}{data['change']:.2f} ({percent_sign}{data['percent_change']:.2f}%) "
+                    f"in {data['currency']}"
+                )
+                
+            elif asset_type == "crypto":
+                data = self.get_crypto_price(asset_id)
+                
+                if not data["success"]:
+                    return {
+                        "response": f"Sorry, I couldn't get information for the cryptocurrency {asset_id}: {data.get('error', 'Unknown error')}",
+                        "source": "Finance Tool",
+                        "success": False
+                    }
+                
+                # Format positive or negative change with appropriate sign
+                change_sign = "+" if data.get("change_24h_percent", 0) >= 0 else ""
+                
+                # Format price with commas for thousands
+                formatted_price = f"{data['price']:,.2f}"
+                
+                # Format market cap with commas for billions
+                market_cap_formatted = ""
+                if data.get("market_cap"):
+                    market_cap_billions = data["market_cap"] / 1_000_000_000
+                    market_cap_formatted = f"Market Cap: ${market_cap_billions:.2f}B"
+                
+                result = (
+                    f"{data['name']} ({data['symbol']}): ${formatted_price} "
+                    f"({change_sign}{data.get('change_24h_percent', 0):.2f}% in 24h) {market_cap_formatted}"
+                )
+            
+            else:
+                return {
+                    "response": "I couldn't determine if you're asking about a stock or cryptocurrency.",
+                    "source": "Finance Tool",
+                    "success": False
+                }
+            
+            return {
+                "response": result,
+                "source": "Finance Tool",
+                "success": True,
+                "data": data
+            }
+            
+        except Exception as e:
+            logging.error(f"Error in FinanceTool: {str(e)}")
+            return {
+                "response": f"Sorry, I couldn't get the financial information you requested: {str(e)}",
+                "source": "Finance Tool",
+                "success": False
+            }
+
+
 class ToolRegistry:
     """Registry of available tools for TARS"""
     
@@ -601,13 +902,12 @@ class ToolRegistry:
 
 # Initialize the default tools
 def create_default_registry() -> ToolRegistry:
-    """Create and initialize the default tool registry"""
+    """Create and return a registry with default tools"""
     registry = ToolRegistry()
-    
-    # Register available tools
     registry.register_tool(WeatherTool())
     registry.register_tool(CalculatorTool())
-    registry.register_tool(NewsTool())
+    registry.register_tool(NewsTool(NEWS_API_KEY))
+    registry.register_tool(FinanceTool())
     
     return registry
 
